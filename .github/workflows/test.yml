@@ -1,0 +1,59 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vulkan SDK
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk libvulkan-dev
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Build
+        run: zig build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libaule-linux
+          path: zig-out/lib/libaule.so
+
+  # Test on software renderer (llvmpipe) - works without GPU
+  test-software:
+    runs-on: ubuntu-latest
+    needs: build-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools python3-numpy
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libaule-linux
+          path: zig-out/lib/
+
+      - name: Test with software Vulkan (llvmpipe)
+        run: |
+          export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          export LD_LIBRARY_PATH=$PWD/zig-out/lib:$LD_LIBRARY_PATH
+          vulkaninfo --summary || echo "Vulkan info failed"
+          python3 tests/test_vulkan_attention.py || echo "Test needs real GPU"

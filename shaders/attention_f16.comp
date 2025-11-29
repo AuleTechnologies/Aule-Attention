@@ -1,0 +1,158 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// FlashAttention-2 Forward Pass - fp16 version
+// Uses 16-bit floats for memory bandwidth efficiency
+// Accumulation done in fp32 for numerical stability
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Storage buffers with fp16 data
+layout(set = 0, binding = 0) readonly buffer QueryBuffer {
+    float16_t data[];  // Stored as fp16
+} Q;
+
+layout(set = 0, binding = 1) readonly buffer KeyBuffer {
+    float16_t data[];
+} K;
+
+layout(set = 0, binding = 2) readonly buffer ValueBuffer {
+    float16_t data[];
+} V;
+
+layout(set = 0, binding = 3) writeonly buffer OutputBuffer {
+    float16_t data[];
+} O;
+
+// Push constants for dimensions
+layout(push_constant) uniform PushConstants {
+    uint batch_size;    // B
+    uint num_heads;     // H
+    uint seq_len;       // N
+    uint head_dim;      // D (must be <= 128 for shared memory)
+    float scale;        // 1/sqrt(D)
+} params;
+
+// Shared memory - use fp16 for Q/K/V tiles to save space
+const uint BLOCK_SIZE = 16;
+
+shared float16_t s_Q[BLOCK_SIZE][128];
+shared float16_t s_K[BLOCK_SIZE][128];
+shared float16_t s_V[BLOCK_SIZE][128];
+shared float s_S[BLOCK_SIZE][BLOCK_SIZE];  // Scores in fp32 for stability
+
+void main() {
+    uint local_row = gl_LocalInvocationID.y;
+    uint local_col = gl_LocalInvocationID.x;
+
+    uint batch_head_idx = gl_WorkGroupID.z;
+    uint batch_idx = batch_head_idx / params.num_heads;
+    uint head_idx = batch_head_idx % params.num_heads;
+    uint block_row = gl_WorkGroupID.y;
+
+    uint global_row = block_row * BLOCK_SIZE + local_row;
+
+    if (batch_idx >= params.batch_size || global_row >= params.seq_len) {
+        return;
+    }
+
+    uint base_offset = (batch_idx * params.num_heads + head_idx) * params.seq_len * params.head_dim;
+
+    // Accumulators in fp32 for numerical stability
+    float row_max = -1e30;
+    float row_sum = 0.0;
+    float output_acc[128];
+    for (uint d = 0; d < params.head_dim; d++) {
+        output_acc[d] = 0.0;
+    }
+
+    // Load Q tile (fp16)
+    for (uint d = local_col; d < params.head_dim; d += BLOCK_SIZE) {
+        if (global_row < params.seq_len) {
+            s_Q[local_row][d] = Q.data[base_offset + global_row * params.head_dim + d];
+        } else {
+            s_Q[local_row][d] = float16_t(0.0);
+        }
+    }
+    barrier();
+
+    uint num_kv_blocks = (params.seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+        uint kv_start = kv_block * BLOCK_SIZE;
+
+        // Load K tile (fp16)
+        for (uint d = local_col; d < params.head_dim; d += BLOCK_SIZE) {
+            uint kv_row = kv_start + local_row;
+            if (kv_row < params.seq_len) {
+                s_K[local_row][d] = K.data[base_offset + kv_row * params.head_dim + d];
+            } else {
+                s_K[local_row][d] = float16_t(0.0);
+            }
+        }
+
+        // Load V tile (fp16)
+        for (uint d = local_col; d < params.head_dim; d += BLOCK_SIZE) {
+            uint kv_row = kv_start + local_row;
+            if (kv_row < params.seq_len) {
+                s_V[local_row][d] = V.data[base_offset + kv_row * params.head_dim + d];
+            } else {
+                s_V[local_row][d] = float16_t(0.0);
+            }
+        }
+        barrier();
+
+        // Compute attention scores in fp32
+        float score = 0.0;
+        for (uint d = 0; d < params.head_dim; d++) {
+            // Convert to fp32 for dot product, then accumulate
+            score += float(s_Q[local_row][d]) * float(s_K[local_col][d]);
+        }
+        score *= params.scale;
+
+        uint global_col = kv_start + local_col;
+        if (global_col >= params.seq_len) {
+            score = -1e30;
+        }
+
+        s_S[local_row][local_col] = score;
+        barrier();
+
+        // Online softmax (fp32)
+        float block_max = -1e30;
+        for (uint c = 0; c < BLOCK_SIZE; c++) {
+            block_max = max(block_max, s_S[local_row][c]);
+        }
+
+        float new_max = max(row_max, block_max);
+        float old_scale = exp(row_max - new_max);
+
+        row_sum = row_sum * old_scale;
+        for (uint d = 0; d < params.head_dim; d++) {
+            output_acc[d] *= old_scale;
+        }
+
+        float block_sum = 0.0;
+        for (uint c = 0; c < BLOCK_SIZE; c++) {
+            float p = exp(s_S[local_row][c] - new_max);
+            block_sum += p;
+
+            for (uint d = 0; d < params.head_dim; d++) {
+                output_acc[d] += p * float(s_V[c][d]);
+            }
+        }
+
+        row_sum += block_sum;
+        row_max = new_max;
+
+        barrier();
+    }
+
+    // Write output as fp16
+    if (global_row < params.seq_len) {
+        float inv_sum = 1.0 / row_sum;
+        for (uint d = 0; d < params.head_dim; d++) {
+            O.data[base_offset + global_row * params.head_dim + d] = float16_t(output_acc[d] * inv_sum);
+        }
+    }
+}

@@ -1,0 +1,209 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// FlashAttention-2 Forward Pass - AMD Optimized Version
+// Optimized for AMD GPUs (GCN/RDNA) with 64-wide wavefronts
+//
+// Supported GPUs:
+// - RX 5000 series (RDNA 1) - ROCm dropped
+// - RX 6000 series (RDNA 2) - ROCm partial
+// - RX 7000 series (RDNA 3) - ROCm partial
+// - RX Vega (GCN 5.0) - ROCm dropped
+// - RX 500 series (GCN 4.0) - Never had ROCm
+// - Radeon 680M/780M APUs - No ROCm
+
+// AMD wavefront size is 64 (or 32 in wave32 mode for RDNA)
+// Use 64x1 workgroup to match wavefront for optimal occupancy
+layout(local_size_x = 64, local_size_y = 1) in;
+
+// Storage buffers
+layout(set = 0, binding = 0) readonly buffer QueryBuffer {
+    float data[];
+} Q;
+
+layout(set = 0, binding = 1) readonly buffer KeyBuffer {
+    float data[];
+} K;
+
+layout(set = 0, binding = 2) readonly buffer ValueBuffer {
+    float data[];
+} V;
+
+layout(set = 0, binding = 3) writeonly buffer OutputBuffer {
+    float data[];
+} O;
+
+// Push constants for dimensions
+layout(push_constant) uniform PushConstants {
+    uint batch_size;    // B
+    uint num_heads;     // H
+    uint seq_len;       // N
+    uint head_dim;      // D (must be <= 128 for this implementation)
+    float scale;        // 1/sqrt(D)
+    uint causal;        // 1 for causal masking (LLMs), 0 for bidirectional
+} params;
+
+// Shared memory - AMD GPUs have 64KB LDS per workgroup
+// Use larger tiles for better memory bandwidth utilization
+const uint TILE_SIZE = 64;  // Match wavefront size
+
+shared float s_K[TILE_SIZE][128];  // K tile: can handle head_dim up to 128
+shared float s_V[TILE_SIZE][128];  // V tile
+
+// Subgroup operations for fast reductions within wavefront
+// AMD GPUs execute 64 threads in lockstep (wavefront)
+
+void main() {
+    uint lane_id = gl_LocalInvocationID.x;  // 0..63 within wavefront
+
+    // Global position
+    uint batch_head_idx = gl_WorkGroupID.z;
+    uint batch_idx = batch_head_idx / params.num_heads;
+    uint head_idx = batch_head_idx % params.num_heads;
+    uint query_row = gl_WorkGroupID.y;  // Which query position
+
+    // Check if this thread is active
+    bool is_active = (batch_idx < params.batch_size) && (query_row < params.seq_len);
+
+    // Base offset for this batch and head
+    uint base_offset = (batch_idx * params.num_heads + head_idx) * params.seq_len * params.head_dim;
+
+    // Each thread in wavefront handles different head dimensions
+    // With 64 threads, we can handle head_dim up to 64 with one thread per dim
+    // For head_dim > 64, threads loop over dimensions
+    uint actual_head_dim = min(params.head_dim, 128u);
+
+    // Load Q value for this thread's dimension(s)
+    float q_vals[2];  // Each thread handles up to 2 dimensions for head_dim=128
+    q_vals[0] = 0.0;
+    q_vals[1] = 0.0;
+
+    if (is_active && lane_id < actual_head_dim) {
+        q_vals[0] = Q.data[base_offset + query_row * params.head_dim + lane_id];
+    }
+    if (is_active && lane_id + 64 < actual_head_dim) {
+        q_vals[1] = Q.data[base_offset + query_row * params.head_dim + lane_id + 64];
+    }
+
+    // Initialize output accumulator and softmax statistics
+    float row_max = -1e30;
+    float row_sum = 0.0;
+    float output_acc[2] = float[2](0.0, 0.0);
+
+    // Number of K/V blocks to iterate over
+    uint num_kv_blocks = (params.seq_len + TILE_SIZE - 1) / TILE_SIZE;
+
+    // Iterate over K/V blocks (FlashAttention outer loop)
+    for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+        uint kv_start = kv_block * TILE_SIZE;
+
+        // Load K/V tile into shared memory
+        // Each thread loads one row of K and V (64 threads = 64 rows = TILE_SIZE)
+        uint kv_row = kv_start + lane_id;
+        bool kv_valid = kv_row < params.seq_len;
+
+        // Load K row
+        for (uint d = 0; d < actual_head_dim; d++) {
+            if (kv_valid && batch_idx < params.batch_size) {
+                s_K[lane_id][d] = K.data[base_offset + kv_row * params.head_dim + d];
+            } else {
+                s_K[lane_id][d] = 0.0;
+            }
+        }
+
+        // Load V row
+        for (uint d = 0; d < actual_head_dim; d++) {
+            if (kv_valid && batch_idx < params.batch_size) {
+                s_V[lane_id][d] = V.data[base_offset + kv_row * params.head_dim + d];
+            } else {
+                s_V[lane_id][d] = 0.0;
+            }
+        }
+
+        barrier();
+
+        // Compute attention scores for this K block
+        // Each thread computes partial dot product, then reduce across wavefront
+
+        float block_max = -1e30;
+        float scores[64];  // One score per K position in tile
+
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            uint global_k = kv_start + k;
+
+            // Compute Q @ K^T for this k position
+            // Each thread contributes one dimension of the dot product
+            float partial_score = 0.0;
+            if (lane_id < actual_head_dim) {
+                partial_score = q_vals[0] * s_K[k][lane_id];
+            }
+            if (lane_id + 64 < actual_head_dim) {
+                partial_score += q_vals[1] * s_K[k][lane_id + 64];
+            }
+
+            // Reduce across wavefront using subgroup operations
+            // Sum all partial scores from all 64 threads
+            float score = subgroupAdd(partial_score);
+
+            score *= params.scale;
+
+            // Mask out-of-bounds positions AND apply causal mask
+            bool is_masked = !is_active || global_k >= params.seq_len;
+
+            // Causal masking: mask positions where key_pos > query_pos
+            if (params.causal != 0u && global_k > query_row) {
+                is_masked = true;
+            }
+
+            if (is_masked) {
+                score = -1e30;
+            }
+
+            scores[k] = score;
+            block_max = max(block_max, score);
+        }
+
+        // Online softmax update
+        if (is_active) {
+            float new_max = max(row_max, block_max);
+            float old_scale_factor = exp(row_max - new_max);
+
+            // Rescale previous accumulator
+            row_sum *= old_scale_factor;
+            output_acc[0] *= old_scale_factor;
+            output_acc[1] *= old_scale_factor;
+
+            // Compute exp(scores - new_max) and accumulate V
+            float block_sum = 0.0;
+            for (uint k = 0; k < TILE_SIZE; k++) {
+                float p = exp(scores[k] - new_max);
+                block_sum += p;
+
+                // Accumulate weighted V
+                if (lane_id < actual_head_dim) {
+                    output_acc[0] += p * s_V[k][lane_id];
+                }
+                if (lane_id + 64 < actual_head_dim) {
+                    output_acc[1] += p * s_V[k][lane_id + 64];
+                }
+            }
+
+            row_sum += block_sum;
+            row_max = new_max;
+        }
+
+        barrier();
+    }
+
+    // Final normalization and write output
+    if (is_active) {
+        float inv_sum = 1.0 / row_sum;
+
+        if (lane_id < actual_head_dim) {
+            O.data[base_offset + query_row * params.head_dim + lane_id] = output_acc[0] * inv_sum;
+        }
+        if (lane_id + 64 < actual_head_dim) {
+            O.data[base_offset + query_row * params.head_dim + lane_id + 64] = output_acc[1] * inv_sum;
+        }
+    }
+}

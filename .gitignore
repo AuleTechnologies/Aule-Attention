@@ -1,0 +1,32 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep the lib directory for the package but ignore .so files at root
+# python/aule/lib/ is intentionally tracked for distribution

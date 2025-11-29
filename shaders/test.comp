@@ -1,0 +1,26 @@
+#version 450
+
+// Trivial test shader: out[i] = in[i] * 2.0
+// Workgroup size: 256 invocations (optimal for most GPUs)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputBuffer {
+    float data[];
+} input_buf;
+
+layout(set = 0, binding = 1) writeonly buffer OutputBuffer {
+    float data[];
+} output_buf;
+
+layout(push_constant) uniform PushConstants {
+    uint count;  // number of elements
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx < params.count) {
+        output_buf.data[idx] = input_buf.data[idx] * 2.0;
+    }
+}
