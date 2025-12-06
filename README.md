@@ -394,5 +394,5 @@ We are grateful to these projects and their maintainers for making hardware-agno
 ---
 
 <p align="center">
-  Made with dedication by <a href="https://github.com/aule-dev">Aule Technologies</a>
+  Made with dedication by <a href="https://auletechnologies.com">Aule Technologies</a>
 </p>
