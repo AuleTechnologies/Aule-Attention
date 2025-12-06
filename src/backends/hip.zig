@@ -6,11 +6,7 @@
 //! Requires ROCm to be installed on the system.
 
 const std = @import("std");
-
-// HIP C API bindings
-const c = @cImport({
-    @cInclude("hip/hip_runtime.h");
-});
+const config = @import("config");
 
 pub const HipError = error{
     InvalidDevice,
@@ -19,9 +15,18 @@ pub const HipError = error{
     NotInitialized,
     LaunchFailure,
     Unknown,
+    NotSupported,
 };
 
-fn checkHipError(err: c.hipError_t) HipError!void {
+// Conditional compilation based on build option
+const use_hip = if (@hasDecl(config, "enable_hip")) config.enable_hip else false;
+
+const c = if (use_hip) @cImport({
+    @cInclude("hip/hip_runtime.h");
+}) else struct {};
+
+fn checkHipError(err: if (use_hip) c.hipError_t else i32) HipError!void {
+    if (!use_hip) return HipError.NotSupported;
     return switch (err) {
         c.hipSuccess => {},
         c.hipErrorInvalidDevice => HipError.InvalidDevice,
@@ -34,7 +39,7 @@ fn checkHipError(err: c.hipError_t) HipError!void {
 }
 
 /// GPU buffer allocated via HIP
-pub const HipBuffer = struct {
+const HipBuffer = if (use_hip) struct {
     ptr: *anyopaque,
     size: usize,
 
@@ -71,15 +76,17 @@ pub const HipBuffer = struct {
             c.hipMemcpyDeviceToHost,
         ));
     }
-};
+} else struct {};
 
 /// HIP tensor for attention operations
 pub const HipTensor = struct {
-    buffer: HipBuffer,
+    buffer: if (use_hip) HipBuffer else void,
     shape: [4]u32,
     element_count: usize,
 
     pub fn init(shape: [4]u32) HipError!HipTensor {
+        if (!use_hip) return HipError.NotSupported;
+        
         var count: usize = 1;
         for (shape) |dim| {
             count *= dim;
@@ -93,17 +100,21 @@ pub const HipTensor = struct {
     }
 
     pub fn deinit(self: *HipTensor) void {
-        self.buffer.deinit();
+        if (use_hip) {
+            self.buffer.deinit();
+        }
         self.* = undefined;
     }
 
     pub fn upload(self: *HipTensor, data: []const f32) HipError!void {
+        if (!use_hip) return HipError.NotSupported;
         if (data.len != self.element_count) return HipError.InvalidValue;
         const bytes = std.mem.sliceAsBytes(data);
         try self.buffer.upload(bytes);
     }
 
     pub fn download(self: *const HipTensor, output: []f32) HipError!void {
+        if (!use_hip) return HipError.NotSupported;
         if (output.len != self.element_count) return HipError.InvalidValue;
         const bytes = std.mem.sliceAsBytes(output);
         try self.buffer.download(bytes);
@@ -112,14 +123,16 @@ pub const HipTensor = struct {
 
 /// HIP attention context
 pub const HipAttention = struct {
-    module: c.hipModule_t,
-    kernel: c.hipFunction_t,
+    module: if (use_hip) c.hipModule_t else void,
+    kernel: if (use_hip) c.hipFunction_t else void,
     device_id: c_int,
 
     const Self = @This();
 
     /// Initialize HIP backend with embedded kernel
     pub fn init() HipError!Self {
+        if (!use_hip) return HipError.NotSupported;
+
         // Initialize HIP
         try checkHipError(c.hipInit(0));
 
@@ -131,15 +144,21 @@ pub const HipAttention = struct {
         // Use first device
         try checkHipError(c.hipSetDevice(0));
 
-        // Load precompiled kernel module
-        // The kernel binary is embedded at compile time
+        // Load precompiled kernel module (embedded at compile time)
         var module: c.hipModule_t = undefined;
-        const kernel_data = @embedFile("attention_hip.hsaco");
-        try checkHipError(c.hipModuleLoadData(&module, kernel_data.ptr));
+
+        // Conditional embed: only load kernel binary when HIP is enabled
+        const kernel_data = if (use_hip) @embedFile("attention_hip.hsaco") else "";
+        
+        if (use_hip) {
+             try checkHipError(c.hipModuleLoadData(&module, kernel_data.ptr));
+        }
 
         // Get kernel function
         var kernel: c.hipFunction_t = undefined;
-        try checkHipError(c.hipModuleGetFunction(&kernel, module, "attention_forward"));
+        if (use_hip) {
+            try checkHipError(c.hipModuleGetFunction(&kernel, module, "attention_forward"));
+        }
 
         return Self{
             .module = module,
@@ -149,7 +168,9 @@ pub const HipAttention = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        _ = c.hipModuleUnload(self.module);
+        if (use_hip) {
+            _ = c.hipModuleUnload(self.module);
+        }
         self.* = undefined;
     }
 
@@ -161,6 +182,8 @@ pub const HipAttention = struct {
         V: *HipTensor,
         output: *HipTensor,
     ) HipError!void {
+        if (!use_hip) return HipError.NotSupported;
+
         const batch_size = Q.shape[0];
         const num_heads = Q.shape[1];
         const seq_len = Q.shape[2];
@@ -205,6 +228,8 @@ pub const HipAttention = struct {
 
 /// Check if HIP/ROCm is available on this system
 pub fn isAvailable() bool {
+    if (!use_hip) return false;
+    
     var device_count: c_int = 0;
     const err = c.hipGetDeviceCount(&device_count);
     return err == c.hipSuccess and device_count > 0;
@@ -212,6 +237,8 @@ pub fn isAvailable() bool {
 
 /// Get device name
 pub fn getDeviceName(allocator: std.mem.Allocator) ![]u8 {
+    if (!use_hip) return error.NotSupported;
+
     var props: c.hipDeviceProp_t = undefined;
     try checkHipError(c.hipGetDeviceProperties(&props, 0));
 

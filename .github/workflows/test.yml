@@ -1,13 +1,38 @@
-name: Build and Test
+name: Tests
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
-  build-linux:
+  test-cpu:
+    name: CPU Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy
+          pip install -e python/
+
+      - name: Run CPU tests
+        run: pytest python/tests/test_cpu.py -v
+
+  build-vulkan:
+    name: Build Vulkan Library
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,27 +58,33 @@ jobs:
           name: libaule-linux
           path: zig-out/lib/libaule.so
 
-  # Test on software renderer (llvmpipe) - works without GPU
-  test-software:
+  test-vulkan:
+    name: Vulkan Tests
     runs-on: ubuntu-latest
-    needs: build-linux
+    needs: build-vulkan
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools python3-numpy
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+          python -m pip install --upgrade pip
+          pip install pytest numpy
+          pip install -e python/
 
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: libaule-linux
-          path: zig-out/lib/
+          path: python/aule/lib/
 
-      - name: Test with software Vulkan (llvmpipe)
+      - name: Run Vulkan tests (software renderer)
         run: |
           export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          export LD_LIBRARY_PATH=$PWD/zig-out/lib:$LD_LIBRARY_PATH
-          vulkaninfo --summary || echo "Vulkan info failed"
-          python3 tests/test_vulkan_attention.py || echo "Test needs real GPU"
+          pytest python/tests/test_vulkan.py -v || echo "Vulkan tests skipped (no GPU)"

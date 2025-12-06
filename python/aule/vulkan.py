@@ -235,29 +235,83 @@ class Aule:
         ]
         self._lib.aule_attention_forward_gpu.restype = ctypes.c_int32
 
-        # GPU info functions
-        self._lib.aule_get_device_name.argtypes = []
-        self._lib.aule_get_device_name.restype = ctypes.c_char_p
+        # GPU info functions (optional - may not be present in all versions)
+        try:
+            self._lib.aule_get_device_name.argtypes = []
+            self._lib.aule_get_device_name.restype = ctypes.c_char_p
+        except AttributeError:
+            pass
 
         self._lib.aule_get_vendor.argtypes = []
         self._lib.aule_get_vendor.restype = ctypes.c_int32
 
-        self._lib.aule_is_amd_optimized.argtypes = []
-        self._lib.aule_is_amd_optimized.restype = ctypes.c_int32
+        # Optional functions
+        try:
+            self._lib.aule_is_amd_optimized.argtypes = []
+            self._lib.aule_is_amd_optimized.restype = ctypes.c_int32
+        except AttributeError:
+            pass
 
-        self._lib.aule_has_fp16.argtypes = []
-        self._lib.aule_has_fp16.restype = ctypes.c_int32
+        try:
+            self._lib.aule_has_fp16.argtypes = []
+            self._lib.aule_has_fp16.restype = ctypes.c_int32
+        except AttributeError:
+            pass
 
-        self._lib.aule_get_subgroup_size.argtypes = []
-        self._lib.aule_get_subgroup_size.restype = ctypes.c_uint32
+        try:
+            self._lib.aule_get_subgroup_size.argtypes = []
+            self._lib.aule_get_subgroup_size.restype = ctypes.c_uint32
+        except AttributeError:
+            pass
+
+        # Backward pass support
+        self._lib.aule_supports_backward.argtypes = []
+        self._lib.aule_supports_backward.restype = ctypes.c_int32
+
+        # Forward with LSE (for training)
+        self._lib.aule_attention_forward_with_lse.argtypes = [
+            ctypes.POINTER(ctypes.c_float),  # query
+            ctypes.POINTER(ctypes.c_float),  # key
+            ctypes.POINTER(ctypes.c_float),  # value
+            ctypes.POINTER(ctypes.c_float),  # output
+            ctypes.POINTER(ctypes.c_float),  # lse
+            ctypes.c_uint32,  # batch_size
+            ctypes.c_uint32,  # num_heads
+            ctypes.c_uint32,  # seq_len
+            ctypes.c_uint32,  # head_dim
+            ctypes.c_int32,   # causal
+        ]
+        self._lib.aule_attention_forward_with_lse.restype = ctypes.c_int32
+
+        # Backward pass
+        self._lib.aule_attention_backward.argtypes = [
+            ctypes.POINTER(ctypes.c_float),  # query
+            ctypes.POINTER(ctypes.c_float),  # key
+            ctypes.POINTER(ctypes.c_float),  # value
+            ctypes.POINTER(ctypes.c_float),  # output
+            ctypes.POINTER(ctypes.c_float),  # grad_output
+            ctypes.POINTER(ctypes.c_float),  # lse
+            ctypes.POINTER(ctypes.c_float),  # grad_query
+            ctypes.POINTER(ctypes.c_float),  # grad_key
+            ctypes.POINTER(ctypes.c_float),  # grad_value
+            ctypes.c_uint32,  # batch_size
+            ctypes.c_uint32,  # num_heads
+            ctypes.c_uint32,  # seq_len
+            ctypes.c_uint32,  # head_dim
+            ctypes.c_int32,   # causal
+        ]
+        self._lib.aule_attention_backward.restype = ctypes.c_int32
 
     @property
     def device_name(self) -> str:
         """Get the GPU device name."""
         if not self._initialized:
             return "Not initialized"
-        name = self._lib.aule_get_device_name()
-        return name.decode() if name else "Unknown"
+        try:
+            name = self._lib.aule_get_device_name()
+            return name.decode() if name else "Unknown"
+        except AttributeError:
+            return "Unknown"
 
     @property
     def vendor(self) -> str:
@@ -273,21 +327,30 @@ class Aule:
         """Check if using AMD-optimized shader path."""
         if not self._initialized:
             return False
-        return self._lib.aule_is_amd_optimized() == 1
+        try:
+            return self._lib.aule_is_amd_optimized() == 1
+        except AttributeError:
+            return False
 
     @property
     def fp16_supported(self) -> bool:
         """Check if FP16 is supported on this GPU."""
         if not self._initialized:
             return False
-        return self._lib.aule_has_fp16() == 1
+        try:
+            return self._lib.aule_has_fp16() == 1
+        except AttributeError:
+            return False
 
     @property
     def subgroup_size(self) -> int:
         """Get the GPU subgroup/wavefront size (32 for NVIDIA, 64 for AMD)."""
         if not self._initialized:
             return 0
-        return self._lib.aule_get_subgroup_size()
+        try:
+            return self._lib.aule_get_subgroup_size()
+        except AttributeError:
+            return 0
 
     def get_device_info(self) -> dict:
         """Get comprehensive GPU device info."""
@@ -443,6 +506,153 @@ class Aule:
 
         return output
 
+    @property
+    def supports_backward(self) -> bool:
+        """Check if backward pass (training) is supported."""
+        if not self._initialized:
+            return False
+        return self._lib.aule_supports_backward() == 1
+
+    def attention_forward_with_lse(
+        self,
+        query: np.ndarray,
+        key: np.ndarray,
+        value: np.ndarray,
+        causal: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute attention forward pass and return LSE for backward.
+
+        Args:
+            query: Query tensor [batch, heads, seq, dim]
+            key: Key tensor [batch, heads, seq, dim]
+            value: Value tensor [batch, heads, seq, dim]
+            causal: Whether to apply causal masking
+
+        Returns:
+            Tuple of (output, lse) where lse is needed for backward pass
+        """
+        if not self._initialized:
+            raise AuleError("Aule not initialized")
+
+        if not self.supports_backward:
+            raise AuleError("Backward pass not supported on this GPU/backend")
+
+        if query.shape != key.shape or query.shape != value.shape:
+            raise ValueError("Q, K, V must have same shape")
+
+        if len(query.shape) != 4:
+            raise ValueError("Expected 4D tensors [batch, heads, seq, dim]")
+
+        batch_size, num_heads, seq_len, head_dim = query.shape
+
+        if head_dim > 64:
+            raise ValueError(f"head_dim must be <= 64. Got {head_dim}")
+
+        # Ensure contiguous float32 arrays
+        query = np.ascontiguousarray(query, dtype=np.float32)
+        key = np.ascontiguousarray(key, dtype=np.float32)
+        value = np.ascontiguousarray(value, dtype=np.float32)
+
+        # Allocate output and LSE
+        output = np.empty_like(query)
+        lse = np.empty((batch_size, num_heads, seq_len), dtype=np.float32)
+
+        # Get pointers
+        q_ptr = query.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        k_ptr = key.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        v_ptr = value.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        o_ptr = output.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        lse_ptr = lse.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        result = self._lib.aule_attention_forward_with_lse(
+            q_ptr, k_ptr, v_ptr, o_ptr, lse_ptr,
+            ctypes.c_uint32(batch_size),
+            ctypes.c_uint32(num_heads),
+            ctypes.c_uint32(seq_len),
+            ctypes.c_uint32(head_dim),
+            ctypes.c_int32(1 if causal else 0),
+        )
+
+        if result != 0:
+            error = self._lib.aule_get_error()
+            raise AuleError(f"Forward with LSE failed: {error.decode()}")
+
+        return output, lse
+
+    def attention_backward(
+        self,
+        query: np.ndarray,
+        key: np.ndarray,
+        value: np.ndarray,
+        output: np.ndarray,
+        grad_output: np.ndarray,
+        lse: np.ndarray,
+        causal: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Compute gradients for attention backward pass.
+
+        Args:
+            query: Query tensor [batch, heads, seq, dim]
+            key: Key tensor [batch, heads, seq, dim]
+            value: Value tensor [batch, heads, seq, dim]
+            output: Output from forward pass [batch, heads, seq, dim]
+            grad_output: Gradient of loss w.r.t. output [batch, heads, seq, dim]
+            lse: Log-sum-exp from forward pass [batch, heads, seq]
+            causal: Whether causal masking was used
+
+        Returns:
+            Tuple of (grad_query, grad_key, grad_value)
+        """
+        if not self._initialized:
+            raise AuleError("Aule not initialized")
+
+        if not self.supports_backward:
+            raise AuleError("Backward pass not supported on this GPU/backend")
+
+        batch_size, num_heads, seq_len, head_dim = query.shape
+
+        # Ensure contiguous float32 arrays
+        query = np.ascontiguousarray(query, dtype=np.float32)
+        key = np.ascontiguousarray(key, dtype=np.float32)
+        value = np.ascontiguousarray(value, dtype=np.float32)
+        output = np.ascontiguousarray(output, dtype=np.float32)
+        grad_output = np.ascontiguousarray(grad_output, dtype=np.float32)
+        lse = np.ascontiguousarray(lse, dtype=np.float32)
+
+        # Allocate gradient outputs
+        grad_query = np.empty_like(query)
+        grad_key = np.empty_like(key)
+        grad_value = np.empty_like(value)
+
+        # Get pointers
+        q_ptr = query.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        k_ptr = key.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        v_ptr = value.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        o_ptr = output.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        do_ptr = grad_output.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        lse_ptr = lse.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        dq_ptr = grad_query.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        dk_ptr = grad_key.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        dv_ptr = grad_value.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        result = self._lib.aule_attention_backward(
+            q_ptr, k_ptr, v_ptr, o_ptr, do_ptr, lse_ptr,
+            dq_ptr, dk_ptr, dv_ptr,
+            ctypes.c_uint32(batch_size),
+            ctypes.c_uint32(num_heads),
+            ctypes.c_uint32(seq_len),
+            ctypes.c_uint32(head_dim),
+            ctypes.c_int32(1 if causal else 0),
+        )
+
+        if result != 0:
+            error = self._lib.aule_get_error()
+            raise AuleError(f"Backward pass failed: {error.decode()}")
+
+        return grad_query, grad_key, grad_value
+
     def close(self):
         """Shut down the aule library and release GPU resources."""
         if self._initialized:
@@ -512,3 +722,69 @@ def flash_attention(
     """
     with Aule() as aule:
         return aule.attention(query, key, value, causal=causal)
+
+
+def supports_backward() -> bool:
+    """
+    Check if backward pass (training) is supported.
+
+    Returns:
+        True if backward pass is available on this GPU/backend
+    """
+    try:
+        with Aule() as aule:
+            return aule.supports_backward
+    except Exception:
+        return False
+
+
+def attention_forward_with_lse(
+    query: np.ndarray,
+    key: np.ndarray,
+    value: np.ndarray,
+    causal: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute attention forward pass and return LSE for backward.
+
+    Args:
+        query: Query tensor [batch, heads, seq, dim]
+        key: Key tensor [batch, heads, seq, dim]
+        value: Value tensor [batch, heads, seq, dim]
+        causal: Whether to apply causal masking
+
+    Returns:
+        Tuple of (output, lse) where lse is needed for backward pass
+    """
+    with Aule() as aule:
+        return aule.attention_forward_with_lse(query, key, value, causal=causal)
+
+
+def attention_backward(
+    query: np.ndarray,
+    key: np.ndarray,
+    value: np.ndarray,
+    output: np.ndarray,
+    grad_output: np.ndarray,
+    lse: np.ndarray,
+    causal: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute gradients for attention backward pass.
+
+    Args:
+        query: Query tensor [batch, heads, seq, dim]
+        key: Key tensor [batch, heads, seq, dim]
+        value: Value tensor [batch, heads, seq, dim]
+        output: Output from forward pass [batch, heads, seq, dim]
+        grad_output: Gradient of loss w.r.t. output [batch, heads, seq, dim]
+        lse: Log-sum-exp from forward pass [batch, heads, seq]
+        causal: Whether causal masking was used
+
+    Returns:
+        Tuple of (grad_query, grad_key, grad_value)
+    """
+    with Aule() as aule:
+        return aule.attention_backward(
+            query, key, value, output, grad_output, lse, causal=causal
+        )

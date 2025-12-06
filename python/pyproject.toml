@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aule-attention"
-version = "0.1.0"
-description = "Hardware-agnostic FlashAttention implementation - works on AMD, NVIDIA, Intel, Apple via Vulkan/OpenCL"
+version = "0.2.0"
+description = "FlashAttention that just works. No compilation. Any GPU. AMD ROCm, NVIDIA CUDA, Intel, Apple via Vulkan."
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -14,13 +14,20 @@ authors = [
 keywords = [
     "attention",
     "flashattention",
+    "flash-attention",
     "transformer",
     "deep-learning",
     "gpu",
     "amd",
     "rocm",
+    "nvidia",
+    "cuda",
+    "intel",
     "vulkan",
-    "opencl",
+    "triton",
+    "llm",
+    "gqa",
+    "mqa",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -42,22 +49,27 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-opencl = ["pyopencl>=2022.1"]
-torch = ["torch>=1.12.0"]
-full = ["pyopencl>=2022.1", "torch>=1.12.0"]
+# For datacenter GPUs (MI300X, H100) - training support
+triton = ["triton>=2.0.0"]
+# For PyTorch integration
+torch = ["torch>=2.0.0"]
+# Full installation with all backends
+full = ["torch>=2.0.0", "triton>=2.0.0"]
+# Development dependencies
 dev = [
     "pytest>=6.0",
     "pytest-benchmark",
     "black",
     "isort",
     "mypy",
+    "torch>=2.0.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/aule-technologies/aule-attention"
-Documentation = "https://github.com/aule-technologies/aule-attention#readme"
-Repository = "https://github.com/aule-technologies/aule-attention"
-Issues = "https://github.com/aule-technologies/aule-attention/issues"
+Homepage = "https://github.com/xenn0010/Aule-Attention"
+Documentation = "https://github.com/xenn0010/Aule-Attention#readme"
+Repository = "https://github.com/xenn0010/Aule-Attention"
+Issues = "https://github.com/xenn0010/Aule-Attention/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]

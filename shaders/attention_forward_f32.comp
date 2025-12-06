@@ -1,0 +1,189 @@
+#version 450
+
+// FlashAttention-2 Forward Pass - fp32 version with LSE output for backward
+// Implements tiled attention with online softmax for O(N) memory complexity
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Storage buffers
+layout(set = 0, binding = 0) readonly buffer QueryBuffer {
+    float data[];
+} Q;
+
+layout(set = 0, binding = 1) readonly buffer KeyBuffer {
+    float data[];
+} K;
+
+layout(set = 0, binding = 2) readonly buffer ValueBuffer {
+    float data[];
+} V;
+
+layout(set = 0, binding = 3) writeonly buffer OutputBuffer {
+    float data[];
+} O;
+
+layout(set = 0, binding = 4) writeonly buffer LogSumExpBuffer {
+    float data[];
+} LSE;  // Log-sum-exp for backward pass
+
+// Push constants for dimensions
+layout(push_constant) uniform PushConstants {
+    uint batch_size;    // B
+    uint num_heads;     // H
+    uint seq_len;       // N
+    uint head_dim;      // D (must be <= 64 for this simple implementation)
+    float scale;        // 1/sqrt(D)
+    uint causal;        // 1 for causal masking (LLMs), 0 for bidirectional
+    uint store_lse;     // 1 to store LSE for backward, 0 to skip
+} params;
+
+// Shared memory for tiles
+const uint BLOCK_SIZE = 16;
+
+shared float s_Q[BLOCK_SIZE][64];       // Q tile: Br x D (max D=64)
+shared float s_K[BLOCK_SIZE][64];       // K tile: Bc x D
+shared float s_V[BLOCK_SIZE][64];       // V tile: Bc x D
+shared float s_S[BLOCK_SIZE][BLOCK_SIZE]; // Attention scores: Br x Bc
+
+void main() {
+    uint local_row = gl_LocalInvocationID.y;  // Row within block (0..Br-1)
+    uint local_col = gl_LocalInvocationID.x;  // Col within block (0..Bc-1)
+
+    // Global position
+    uint batch_head_idx = gl_WorkGroupID.z;
+    uint batch_idx = batch_head_idx / params.num_heads;
+    uint head_idx = batch_head_idx % params.num_heads;
+    uint block_row = gl_WorkGroupID.y;  // Which Q block
+
+    uint global_row = block_row * BLOCK_SIZE + local_row;
+
+    // Check if this thread is active (has valid work to do)
+    bool is_active = (batch_idx < params.batch_size) && (global_row < params.seq_len);
+
+    // Base offset for this batch and head
+    uint base_offset = (batch_idx * params.num_heads + head_idx) * params.seq_len * params.head_dim;
+    uint lse_offset = (batch_idx * params.num_heads + head_idx) * params.seq_len;
+
+    // Initialize output accumulator and softmax statistics (per row)
+    float row_max = -1e30;
+    float row_sum = 0.0;
+    float output_acc[64];  // Accumulator for D dimensions (max 64)
+
+    uint actual_head_dim = min(params.head_dim, 64u);
+
+    for (uint d = 0; d < actual_head_dim; d++) {
+        output_acc[d] = 0.0;
+    }
+
+    // Load Q tile into shared memory (each thread loads multiple elements)
+    for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+        if (is_active) {
+            s_Q[local_row][d] = Q.data[base_offset + global_row * params.head_dim + d];
+        } else {
+            s_Q[local_row][d] = 0.0;
+        }
+    }
+    barrier();
+
+    // Number of K/V blocks to iterate over
+    uint num_kv_blocks = (params.seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // Iterate over K/V blocks (the outer loop of FlashAttention)
+    for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+        uint kv_start = kv_block * BLOCK_SIZE;
+        uint kv_row = kv_start + local_row;
+        bool kv_valid = kv_row < params.seq_len;
+
+        // Load K tile into shared memory
+        for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+            if (kv_valid && batch_idx < params.batch_size) {
+                s_K[local_row][d] = K.data[base_offset + kv_row * params.head_dim + d];
+            } else {
+                s_K[local_row][d] = 0.0;
+            }
+        }
+
+        // Load V tile into shared memory
+        for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+            if (kv_valid && batch_idx < params.batch_size) {
+                s_V[local_row][d] = V.data[base_offset + kv_row * params.head_dim + d];
+            } else {
+                s_V[local_row][d] = 0.0;
+            }
+        }
+        barrier();
+
+        // Compute attention scores S = Q @ K^T for this block
+        // Each thread computes one element of the Br x Bc score matrix
+        float score = 0.0;
+        for (uint d = 0; d < actual_head_dim; d++) {
+            score += s_Q[local_row][d] * s_K[local_col][d];
+        }
+        score *= params.scale;
+
+        // Mask out-of-bounds positions AND apply causal mask
+        uint global_col = kv_start + local_col;
+        bool is_masked = !is_active || global_col >= params.seq_len;
+
+        // Causal masking: mask positions where key_pos > query_pos
+        if (params.causal != 0u && global_col > global_row) {
+            is_masked = true;
+        }
+
+        if (is_masked) {
+            score = -1e30;
+        }
+
+        s_S[local_row][local_col] = score;
+        barrier();
+
+        // Online softmax update (per row) - only for active threads
+        if (is_active) {
+            // Find max in this block for our row
+            float block_max = -1e30;
+            for (uint c = 0; c < BLOCK_SIZE; c++) {
+                block_max = max(block_max, s_S[local_row][c]);
+            }
+
+            // Update running max and rescale
+            float new_max = max(row_max, block_max);
+            float old_scale_factor = exp(row_max - new_max);
+
+            // Rescale previous accumulator
+            row_sum = row_sum * old_scale_factor;
+            for (uint d = 0; d < actual_head_dim; d++) {
+                output_acc[d] *= old_scale_factor;
+            }
+
+            // Compute exp(scores - new_max) and accumulate
+            float block_sum = 0.0;
+            for (uint c = 0; c < BLOCK_SIZE; c++) {
+                float p = exp(s_S[local_row][c] - new_max);
+                block_sum += p;
+
+                // Accumulate weighted V
+                for (uint d = 0; d < actual_head_dim; d++) {
+                    output_acc[d] += p * s_V[c][d];
+                }
+            }
+
+            row_sum += block_sum;
+            row_max = new_max;
+        }
+
+        barrier();
+    }
+
+    // Final normalization and write output
+    if (is_active) {
+        float inv_sum = 1.0 / row_sum;
+        for (uint d = 0; d < actual_head_dim; d++) {
+            O.data[base_offset + global_row * params.head_dim + d] = output_acc[d] * inv_sum;
+        }
+
+        // Store LSE for backward pass
+        if (params.store_lse != 0u) {
+            LSE.data[lse_offset + global_row] = row_max + log(row_sum);
+        }
+    }
+}

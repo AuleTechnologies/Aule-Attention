@@ -2,6 +2,9 @@
 .zig-cache/
 zig-out/
 
+#js claude
+.claude/
+
 # Python
 __pycache__/
 *.py[cod]

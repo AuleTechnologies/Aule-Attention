@@ -1,0 +1,234 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : enable
+
+// FlashAttention-2 Backward Pass - fp32 version
+// Computes gradients dQ, dK, dV given dO (gradient of output)
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Storage buffers - inputs
+layout(set = 0, binding = 0) readonly buffer QueryBuffer {
+    float data[];
+} Q;
+
+layout(set = 0, binding = 1) readonly buffer KeyBuffer {
+    float data[];
+} K;
+
+layout(set = 0, binding = 2) readonly buffer ValueBuffer {
+    float data[];
+} V;
+
+layout(set = 0, binding = 3) readonly buffer OutputBuffer {
+    float data[];
+} O;
+
+layout(set = 0, binding = 4) readonly buffer GradOutputBuffer {
+    float data[];
+} dO;
+
+layout(set = 0, binding = 5) readonly buffer LogSumExpBuffer {
+    float data[];
+} LSE;  // Log-sum-exp from forward pass
+
+// Storage buffers - outputs (gradients)
+layout(set = 0, binding = 6) buffer GradQueryBuffer {
+    float data[];
+} dQ;
+
+layout(set = 0, binding = 7) buffer GradKeyBuffer {
+    float data[];
+} dK;
+
+layout(set = 0, binding = 8) buffer GradValueBuffer {
+    float data[];
+} dV;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint batch_size;
+    uint num_heads;
+    uint seq_len;
+    uint head_dim;
+    float scale;
+    uint causal;
+} params;
+
+const uint BLOCK_SIZE = 16;
+
+// Shared memory
+shared float s_Q[BLOCK_SIZE][64];
+shared float s_K[BLOCK_SIZE][64];
+shared float s_V[BLOCK_SIZE][64];
+shared float s_O[BLOCK_SIZE][64];
+shared float s_dO[BLOCK_SIZE][64];
+shared float s_dV[BLOCK_SIZE][64];
+shared float s_dK[BLOCK_SIZE][64];
+shared float s_S[BLOCK_SIZE][BLOCK_SIZE];
+shared float s_P[BLOCK_SIZE][BLOCK_SIZE];
+shared float s_LSE[BLOCK_SIZE];
+shared float s_delta[BLOCK_SIZE];
+
+void main() {
+    uint local_row = gl_LocalInvocationID.y;
+    uint local_col = gl_LocalInvocationID.x;
+
+    uint batch_head_idx = gl_WorkGroupID.z;
+    uint batch_idx = batch_head_idx / params.num_heads;
+    uint head_idx = batch_head_idx % params.num_heads;
+    uint kv_block = gl_WorkGroupID.y;  // Which K/V block
+
+    uint kv_start = kv_block * BLOCK_SIZE;
+    uint kv_row = kv_start + local_row;
+    bool kv_valid = (batch_idx < params.batch_size) && (kv_row < params.seq_len);
+
+    uint base_offset = (batch_idx * params.num_heads + head_idx) * params.seq_len * params.head_dim;
+    uint lse_offset = (batch_idx * params.num_heads + head_idx) * params.seq_len;
+
+    uint actual_head_dim = min(params.head_dim, 64u);
+
+    // Initialize dK, dV accumulators to zero
+    for (uint d = 0; d < actual_head_dim; d++) {
+        s_dK[local_row][d] = 0.0;
+        s_dV[local_row][d] = 0.0;
+    }
+
+    // Load K, V for this block
+    for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+        if (kv_valid) {
+            s_K[local_row][d] = K.data[base_offset + kv_row * params.head_dim + d];
+            s_V[local_row][d] = V.data[base_offset + kv_row * params.head_dim + d];
+        } else {
+            s_K[local_row][d] = 0.0;
+            s_V[local_row][d] = 0.0;
+        }
+    }
+    barrier();
+
+    // Number of Q blocks
+    uint num_q_blocks = (params.seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // For causal: only process Q blocks where q_pos >= kv_start
+    uint start_q_block = 0;
+    if (params.causal != 0u) {
+        start_q_block = kv_block;
+    }
+
+    // Iterate over Q blocks
+    for (uint q_block = start_q_block; q_block < num_q_blocks; q_block++) {
+        uint q_start = q_block * BLOCK_SIZE;
+        uint q_row = q_start + local_row;
+        bool q_valid = (batch_idx < params.batch_size) && (q_row < params.seq_len);
+
+        // Load Q, O, dO, LSE for this Q block
+        for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+            if (q_valid) {
+                s_Q[local_row][d] = Q.data[base_offset + q_row * params.head_dim + d];
+                s_O[local_row][d] = O.data[base_offset + q_row * params.head_dim + d];
+                s_dO[local_row][d] = dO.data[base_offset + q_row * params.head_dim + d];
+            } else {
+                s_Q[local_row][d] = 0.0;
+                s_O[local_row][d] = 0.0;
+                s_dO[local_row][d] = 0.0;
+            }
+        }
+
+        // Load LSE
+        if (local_col == 0 && q_valid) {
+            s_LSE[local_row] = LSE.data[lse_offset + q_row];
+        }
+        barrier();
+
+        // Compute delta = rowsum(O * dO) for each Q row
+        if (local_col == 0 && q_valid) {
+            float delta = 0.0;
+            for (uint d = 0; d < actual_head_dim; d++) {
+                delta += s_O[local_row][d] * s_dO[local_row][d];
+            }
+            s_delta[local_row] = delta;
+        }
+        barrier();
+
+        // Compute attention scores S = Q @ K^T
+        float score = 0.0;
+        for (uint d = 0; d < actual_head_dim; d++) {
+            score += s_Q[local_row][d] * s_K[local_col][d];
+        }
+        score *= params.scale;
+
+        // Apply masks
+        uint global_q = q_start + local_row;
+        uint global_k = kv_start + local_col;
+        bool is_masked = !q_valid || global_k >= params.seq_len;
+
+        if (params.causal != 0u && global_k > global_q) {
+            is_masked = true;
+        }
+
+        if (is_masked) {
+            score = -1e30;
+        }
+
+        s_S[local_row][local_col] = score;
+        barrier();
+
+        // Compute P = softmax(S) using stored LSE
+        float lse_val = s_LSE[local_row];
+        float p = is_masked ? 0.0 : exp(score - lse_val);
+        s_P[local_row][local_col] = p;
+        barrier();
+
+        // dV += P^T @ dO
+        // Each thread in KV block accumulates contribution from this Q block
+        if (kv_valid) {
+            for (uint q = 0; q < BLOCK_SIZE; q++) {
+                float p_val = s_P[q][local_row];  // P[q, local_row] (transposed access)
+                for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+                    s_dV[local_row][d] += p_val * s_dO[q][d];
+                }
+            }
+        }
+        barrier();
+
+        // Compute dP = dO @ V^T (stored in s_S temporarily)
+        float dp = 0.0;
+        for (uint d = 0; d < actual_head_dim; d++) {
+            dp += s_dO[local_row][d] * s_V[local_col][d];
+        }
+
+        // Compute dS = P * (dP - delta)
+        float ds = s_P[local_row][local_col] * (dp - s_delta[local_row]) * params.scale;
+        s_S[local_row][local_col] = ds;  // Reuse s_S for dS
+        barrier();
+
+        // dK += dS^T @ Q
+        if (kv_valid) {
+            for (uint q = 0; q < BLOCK_SIZE; q++) {
+                float ds_val = s_S[q][local_row];  // dS[q, local_row] (transposed access)
+                for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+                    s_dK[local_row][d] += ds_val * s_Q[q][d];
+                }
+            }
+        }
+
+        // dQ += dS @ K (atomic add to global memory)
+        if (q_valid) {
+            for (uint k = 0; k < BLOCK_SIZE; k++) {
+                float ds_val = s_S[local_row][k];
+                for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+                    atomicAdd(dQ.data[base_offset + q_row * params.head_dim + d], ds_val * s_K[k][d]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Write accumulated dK, dV
+    if (kv_valid) {
+        for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+            atomicAdd(dK.data[base_offset + kv_row * params.head_dim + d], s_dK[local_row][d]);
+            atomicAdd(dV.data[base_offset + kv_row * params.head_dim + d], s_dV[local_row][d]);
+        }
+    }
+}
