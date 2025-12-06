@@ -10,7 +10,10 @@ import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple
 
-# Find the shared library
+# Library path (resolved at import time)
+_LIBRARY_PATH: Optional[Path] = None
+
+
 def _find_library() -> Path:
     """Find the aule shared library."""
     import platform
@@ -159,12 +162,12 @@ class Aule:
 
         Args:
             library_path: Optional path to the aule shared library.
-                         If None, will search standard locations.
+                         If None, uses the library found at import time.
         """
         if library_path:
             lib_path = Path(library_path)
         else:
-            lib_path = _find_library()
+            lib_path = _LIBRARY_PATH
 
         self._lib = ctypes.CDLL(str(lib_path))
         self._setup_functions()
@@ -788,3 +791,8 @@ def attention_backward(
         return aule.attention_backward(
             query, key, value, output, grad_output, lse, causal=causal
         )
+
+
+# Verify library exists at import time - this allows __init__.py to
+# properly detect if Vulkan backend is available
+_LIBRARY_PATH = _find_library()
