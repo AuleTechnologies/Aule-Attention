@@ -77,14 +77,49 @@ def flash_attention(query, key, value, causal=True, scale=None):
     except ImportError:
         pass
 
+    # Determine which backend to use
+    use_triton = False
+    use_vulkan = False
+    use_cpu = False
+    backend_name = None
+
+    if _forced_backend == 'triton':
+        if _triton_available:
+            use_triton = True
+            backend_name = 'triton (forced)'
+        else:
+            raise RuntimeError("Triton backend forced but not available")
+    elif _forced_backend == 'vulkan':
+        if _vulkan_available:
+            use_vulkan = True
+            backend_name = 'vulkan (forced)'
+        else:
+            raise RuntimeError("Vulkan backend forced but not available")
+    elif _forced_backend == 'cpu':
+        use_cpu = True
+        backend_name = 'cpu (forced)'
+    else:
+        # Auto-select
+        if is_torch and _triton_available and query.is_cuda:
+            use_triton = True
+            backend_name = 'triton'
+        elif _vulkan_available:
+            use_vulkan = True
+            backend_name = 'vulkan'
+        else:
+            use_cpu = True
+            backend_name = 'cpu'
+
+    if _verbose:
+        shape = tuple(query.shape)
+        print(f"aule-attention: {backend_name} | shape={shape} | causal={causal}")
+
     if is_torch:
-        # Use Triton if available and on CUDA
-        if _triton_available and query.is_cuda:
+        if use_triton:
             from .triton_flash import flash_attention_triton
             return flash_attention_triton(query, key, value, causal=causal, scale=scale)
 
-        # Fall back to Vulkan (will use CPU if no GPU Vulkan)
-        if _vulkan_available:
+        if use_vulkan:
             q_np = query.cpu().numpy()
             k_np = key.cpu().numpy()
             v_np = value.cpu().numpy()
@@ -92,11 +127,12 @@ def flash_attention(query, key, value, causal=True, scale=None):
             return torch.from_numpy(out_np).to(query.device)
 
         # CPU fallback
-        return _cpu_attention(query.cpu().numpy(), key.cpu().numpy(), value.cpu().numpy(), causal)
+        out_np = _cpu_attention(query.cpu().numpy(), key.cpu().numpy(), value.cpu().numpy(), causal)
+        return torch.from_numpy(out_np).to(query.device)
 
     else:
         # NumPy input
-        if _vulkan_available:
+        if use_vulkan:
             return vulkan_attention(query, key, value, causal=causal)
         return _cpu_attention(query, key, value, causal)
 
@@ -138,6 +174,8 @@ attention = flash_attention
 
 _original_sdpa = None
 _installed = False
+_forced_backend = None  # None = auto, 'triton', 'vulkan', 'cpu'
+_verbose = False
 
 
 def scaled_dot_product_attention(
@@ -171,8 +209,16 @@ def scaled_dot_product_attention(
     """
     import torch
 
+    # Check head_dim - Vulkan backend limited to 64, fall back if larger
+    head_dim = query.shape[-1]
+    needs_fallback = (
+        attn_mask is not None or
+        dropout_p > 0.0 or
+        (head_dim > 64 and not _triton_available)  # Triton handles any head_dim
+    )
+
     # Fall back to PyTorch for unsupported features
-    if attn_mask is not None or dropout_p > 0.0:
+    if needs_fallback:
         if _original_sdpa is not None:
             return _original_sdpa(
                 query, key, value,
@@ -197,32 +243,48 @@ def scaled_dot_product_attention(
     return flash_attention(query, key, value, causal=is_causal, scale=scale)
 
 
-def install():
+def install(backend=None, verbose=False):
     """
     Install aule-attention as the default PyTorch attention backend.
 
     After calling this, all models using torch.nn.functional.scaled_dot_product_attention
     will automatically use aule-attention (Triton on ROCm/CUDA, Vulkan on consumer GPUs).
 
+    Args:
+        backend: Force a specific backend. Options:
+                 - None (default): Auto-select best available
+                 - 'triton': Force Triton backend (requires CUDA)
+                 - 'vulkan': Force Vulkan backend
+                 - 'cpu': Force CPU/NumPy backend
+        verbose: If True, print which backend is used for each attention call
+
     Usage:
         import aule
-        aule.install()
+        aule.install()  # Auto-select
 
-        # Now load any model - it uses aule-attention automatically
-        model = load_model(...)
+        # Or force a specific backend:
+        aule.install(backend='vulkan')
+        aule.install(backend='triton', verbose=True)
 
     Works with:
         - ComfyUI (Stable Diffusion, SDXL, Flux, SD3)
         - Hugging Face Transformers
         - Any PyTorch model using F.scaled_dot_product_attention
     """
-    global _original_sdpa, _installed
+    global _original_sdpa, _installed, _forced_backend, _verbose
 
     import torch
     import torch.nn.functional as F
 
+    # Validate backend option
+    if backend is not None and backend not in ('triton', 'vulkan', 'cpu'):
+        raise ValueError(f"Invalid backend '{backend}'. Choose from: 'triton', 'vulkan', 'cpu', or None (auto)")
+
     if _installed:
-        print("aule-attention: Already installed")
+        # Allow changing backend/verbose on reinstall
+        _forced_backend = backend
+        _verbose = verbose
+        print(f"aule-attention: Updated (backend={backend or 'auto'}, verbose={verbose})")
         return
 
     # Save original for fallback
@@ -233,17 +295,23 @@ def install():
     torch.nn.functional.scaled_dot_product_attention = scaled_dot_product_attention
 
     _installed = True
+    _forced_backend = backend
+    _verbose = verbose
 
     # Report what backend will be used
-    backends = get_available_backends()
-    if 'triton' in backends:
-        backend_name = "Triton (ROCm/CUDA)"
-    elif 'vulkan' in backends:
-        backend_name = "Vulkan"
+    if backend:
+        backend_name = backend.capitalize()
     else:
-        backend_name = "CPU"
+        backends = get_available_backends()
+        if 'triton' in backends:
+            backend_name = "auto: Triton"
+        elif 'vulkan' in backends:
+            backend_name = "auto: Vulkan"
+        else:
+            backend_name = "auto: CPU"
 
-    print(f"aule-attention: Installed ({backend_name} backend)")
+    verbose_str = ", verbose" if verbose else ""
+    print(f"aule-attention: Installed ({backend_name}{verbose_str})")
 
 
 def uninstall():
