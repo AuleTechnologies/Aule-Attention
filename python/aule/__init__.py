@@ -42,6 +42,11 @@ try:
 except Exception:
     pass
 
+try:
+    from .patching import patch_model
+except ImportError:
+    pass
+
 
 def flash_attention(query, key, value, causal=True, scale=None):
     """
@@ -125,6 +130,141 @@ def _cpu_attention(q, k, v, causal=True):
 
 # Alias for compatibility
 attention = flash_attention
+
+
+# =============================================================================
+# PyTorch SDPA Compatibility Layer
+# =============================================================================
+
+_original_sdpa = None
+_installed = False
+
+
+def scaled_dot_product_attention(
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    scale=None,
+    enable_gqa=False,
+):
+    """
+    Drop-in replacement for torch.nn.functional.scaled_dot_product_attention.
+
+    Uses aule-attention backends (Triton/Vulkan/CPU) while maintaining
+    full API compatibility with PyTorch's SDPA.
+
+    Args:
+        query: [batch, heads, seq_len_q, head_dim]
+        key: [batch, heads_kv, seq_len_k, head_dim]
+        value: [batch, heads_kv, seq_len_k, head_dim]
+        attn_mask: Optional attention mask (falls back to PyTorch if provided)
+        dropout_p: Dropout probability (falls back to PyTorch if > 0)
+        is_causal: Apply causal masking
+        scale: Attention scale (default 1/sqrt(head_dim))
+        enable_gqa: Enable grouped query attention (handled automatically)
+
+    Returns:
+        Output tensor [batch, heads, seq_len_q, head_dim]
+    """
+    import torch
+
+    # Fall back to PyTorch for unsupported features
+    if attn_mask is not None or dropout_p > 0.0:
+        if _original_sdpa is not None:
+            return _original_sdpa(
+                query, key, value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
+        else:
+            # Manual fallback if original not saved
+            return torch.nn.functional.scaled_dot_product_attention(
+                query, key, value,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=scale,
+                enable_gqa=enable_gqa,
+            )
+
+    # Use aule-attention
+    return flash_attention(query, key, value, causal=is_causal, scale=scale)
+
+
+def install():
+    """
+    Install aule-attention as the default PyTorch attention backend.
+
+    After calling this, all models using torch.nn.functional.scaled_dot_product_attention
+    will automatically use aule-attention (Triton on ROCm/CUDA, Vulkan on consumer GPUs).
+
+    Usage:
+        import aule
+        aule.install()
+
+        # Now load any model - it uses aule-attention automatically
+        model = load_model(...)
+
+    Works with:
+        - ComfyUI (Stable Diffusion, SDXL, Flux, SD3)
+        - Hugging Face Transformers
+        - Any PyTorch model using F.scaled_dot_product_attention
+    """
+    global _original_sdpa, _installed
+
+    import torch
+    import torch.nn.functional as F
+
+    if _installed:
+        print("aule-attention: Already installed")
+        return
+
+    # Save original for fallback
+    _original_sdpa = F.scaled_dot_product_attention
+
+    # Install our version
+    F.scaled_dot_product_attention = scaled_dot_product_attention
+    torch.nn.functional.scaled_dot_product_attention = scaled_dot_product_attention
+
+    _installed = True
+
+    # Report what backend will be used
+    backends = get_available_backends()
+    if 'triton' in backends:
+        backend_name = "Triton (ROCm/CUDA)"
+    elif 'vulkan' in backends:
+        backend_name = "Vulkan"
+    else:
+        backend_name = "CPU"
+
+    print(f"aule-attention: Installed ({backend_name} backend)")
+
+
+def uninstall():
+    """
+    Restore the original PyTorch SDPA implementation.
+    """
+    global _original_sdpa, _installed
+
+    if not _installed:
+        print("aule-attention: Not installed")
+        return
+
+    import torch
+    import torch.nn.functional as F
+
+    if _original_sdpa is not None:
+        F.scaled_dot_product_attention = _original_sdpa
+        torch.nn.functional.scaled_dot_product_attention = _original_sdpa
+
+    _installed = False
+    print("aule-attention: Uninstalled, restored PyTorch SDPA")
 
 
 def get_available_backends():
@@ -211,6 +351,10 @@ __all__ = [
     # Core API
     "flash_attention",
     "attention",
+    "scaled_dot_product_attention",
+    # Installation (for ComfyUI, etc.)
+    "install",
+    "uninstall",
     # Backend info
     "get_available_backends",
     "get_backend_info",
@@ -219,6 +363,8 @@ __all__ = [
     "Aule",
     "GpuTensor",
     "AuleError",
+    # Patching (legacy)
+    "patch_model",
     # Version
     "__version__",
 ]
