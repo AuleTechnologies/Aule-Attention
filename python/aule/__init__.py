@@ -30,10 +30,18 @@ _cpu_available = True
 
 # Try Triton backend first (best for ROCm and CUDA)
 try:
-    from .triton_flash import flash_attention_triton, is_triton_available
+    from .triton_flash import (
+        flash_attention_triton,
+        flash_attention_rope,
+        is_triton_available,
+        precompute_rope_frequencies,
+        apply_rope_separate,
+    )
     _triton_available = is_triton_available()
 except ImportError:
-    pass
+    flash_attention_rope = None
+    precompute_rope_frequencies = None
+    apply_rope_separate = None
 
 # Try Vulkan backend (for consumer GPUs without ROCm/CUDA)
 try:
@@ -48,7 +56,7 @@ except ImportError:
     pass
 
 
-def flash_attention(query, key, value, causal=True, scale=None):
+def flash_attention(query, key, value, rot_cos=None, rot_sin=None, causal=True, scale=None):
     """
     FlashAttention-2 implementation.
 
@@ -123,17 +131,31 @@ def flash_attention(query, key, value, causal=True, scale=None):
             q_np = query.cpu().numpy()
             k_np = key.cpu().numpy()
             v_np = value.cpu().numpy()
+
+            # RoPE not yet supported in Vulkan backend
+            if rot_cos is not None or rot_sin is not None:
+                import warnings
+                warnings.warn("RoPE not yet supported in Vulkan backend, ignoring rot_cos/rot_sin")
+
             out_np = vulkan_attention(q_np, k_np, v_np, causal=causal)
             return torch.from_numpy(out_np).to(query.device)
 
         # CPU fallback
+        if rot_cos is not None:
+             print("Warning: RoPE not supported on CPU fallback yet")
         out_np = _cpu_attention(query.cpu().numpy(), key.cpu().numpy(), value.cpu().numpy(), causal)
         return torch.from_numpy(out_np).to(query.device)
 
     else:
         # NumPy input
         if use_vulkan:
+            # RoPE not yet supported in Vulkan backend
+            if rot_cos is not None or rot_sin is not None:
+                import warnings
+                warnings.warn("RoPE not yet supported in Vulkan backend, ignoring rot_cos/rot_sin")
             return vulkan_attention(query, key, value, causal=causal)
+        if rot_cos is not None:
+             print("Warning: RoPE not supported on CPU fallback yet")
         return _cpu_attention(query, key, value, causal)
 
 
@@ -420,6 +442,10 @@ __all__ = [
     "flash_attention",
     "attention",
     "scaled_dot_product_attention",
+    # Fused RoPE + Attention
+    "flash_attention_rope",
+    "precompute_rope_frequencies",
+    "apply_rope_separate",
     # Installation (for ComfyUI, etc.)
     "install",
     "uninstall",

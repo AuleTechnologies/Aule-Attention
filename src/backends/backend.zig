@@ -295,16 +295,32 @@ pub const AttentionContext = struct {
         K: *Tensor,
         V: *Tensor,
         output: *Tensor,
+        rot_cos: ?*Tensor,
+        rot_sin: ?*Tensor,
         causal: bool,
     ) BackendError!void {
         switch (self.backend) {
             .vulkan => {
                 const ctx = self.vulkan_ctx orelse return BackendError.BackendInitFailed;
+                
+                // Extract Vulkan handles for RoPE if present
+                var rot_cos_vk: ?*const GpuTensor = null;
+                if (rot_cos) |t| {
+                    if (t.backend == .vulkan) rot_cos_vk = t.handle.vulkan;
+                }
+                
+                var rot_sin_vk: ?*const GpuTensor = null;
+                if (rot_sin) |t| {
+                    if (t.backend == .vulkan) rot_sin_vk = t.handle.vulkan;
+                }
+
                 ctx.forwardSync(
                     Q.handle.vulkan,
                     K.handle.vulkan,
                     V.handle.vulkan,
                     output.handle.vulkan,
+                    rot_cos_vk,
+                    rot_sin_vk,
                     causal
                 ) catch |err| switch (err) {
                     error.InvalidShape, error.ShapeMismatch => return BackendError.ShapeMismatch,

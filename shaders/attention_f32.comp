@@ -3,24 +3,37 @@
 // FlashAttention-2 Forward Pass - fp32 version
 // Implements tiled attention with online softmax for O(N) memory complexity
 
-layout(local_size_x = 16, local_size_y = 16) in;
+/*
+    Simple Tiled Attention Shader (Forward Pass)
+    Workgroup size: [16, 16, 1] - processes 16x16 tile of QK^T
+*/
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 // Storage buffers
-layout(set = 0, binding = 0) readonly buffer QueryBuffer {
+layout(std430, set = 0, binding = 0) readonly buffer QBuffer {
     float data[];
 } Q;
 
-layout(set = 0, binding = 1) readonly buffer KeyBuffer {
+layout(std430, set = 0, binding = 1) readonly buffer KBuffer {
     float data[];
 } K;
 
-layout(set = 0, binding = 2) readonly buffer ValueBuffer {
+layout(std430, set = 0, binding = 2) readonly buffer VBuffer {
     float data[];
 } V;
 
-layout(set = 0, binding = 3) writeonly buffer OutputBuffer {
+layout(std430, set = 0, binding = 3) writeonly buffer OutputBuffer {
     float data[];
 } O;
+
+layout(std430, set = 0, binding = 4) readonly buffer RotaryCosBuffer {
+    float data[];
+} RotCos;
+
+layout(std430, set = 0, binding = 5) readonly buffer RotarySinBuffer {
+    float data[];
+} RotSin;
 
 // Push constants for dimensions
 layout(push_constant) uniform PushConstants {
@@ -30,6 +43,9 @@ layout(push_constant) uniform PushConstants {
     uint head_dim;      // D (must be <= 64 for this simple implementation)
     float scale;        // 1/sqrt(D)
     uint causal;        // 1 for causal masking (LLMs), 0 for bidirectional
+    uint has_rope;      // 1 to apply RoPE, 0 to skip
+    uint num_kv_heads;  // New: Number of K/V heads (<= num_heads)
+    uint key_seq_len;   // New: Sequence length for K/V
 } params;
 
 // Shared memory for tiles
@@ -48,6 +64,21 @@ void main() {
     uint batch_head_idx = gl_WorkGroupID.z;
     uint batch_idx = batch_head_idx / params.num_heads;
     uint head_idx = batch_head_idx % params.num_heads;
+    
+    // GQA Logic: Map many Q heads to fewer KV heads
+    // ratio = num_q_heads / num_kv_heads
+    // kv_head_idx = q_head_idx / ratio
+    // kv_batch_head = batch * num_kv_heads + kv_head_idx
+    
+    // Assumes params.num_kv_heads > 0 and params.num_heads % params.num_kv_heads == 0
+    uint ratio = params.num_heads / params.num_kv_heads;
+    uint kv_head_idx = head_idx / ratio;
+    uint kv_batch_head_idx = batch_idx * params.num_kv_heads + kv_head_idx;
+    
+    // Base offsets
+    uint qs_off = batch_head_idx * params.seq_len * params.head_dim;
+    uint ks_off = kv_batch_head_idx * params.key_seq_len * params.head_dim;
+    uint vs_off = kv_batch_head_idx * params.key_seq_len * params.head_dim;
     uint block_row = gl_WorkGroupID.y;  // Which Q block
 
     uint global_row = block_row * BLOCK_SIZE + local_row;
@@ -71,39 +102,93 @@ void main() {
 
     // Load Q tile into shared memory (each thread loads multiple elements)
     for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+        float q_val = 0.0;
         if (is_active) {
-            s_Q[local_row][d] = Q.data[base_offset + global_row * params.head_dim + d];
-        } else {
-            s_Q[local_row][d] = 0.0;
+            q_val = Q.data[base_offset + global_row * params.head_dim + d];
+            
+            // Apply RoPE if enabled
+            // Standard RoPE pairs adjacent elements (d, d+1) if d is even, or (d-1, d) if d is odd.
+            // Assumption: head_dim is even.
+            // Formula:
+            // x_new = x * cos - y * sin
+            // y_new = x * sin + y * cos
+            if (params.has_rope != 0u) {
+                // Get rotation index for this position (global_row) and dimension (d)
+                // For Llama, RoPE is applied to the first 'rotary_dim' elements.
+                // We assume full rotary for now (simpler).
+                uint rot_idx = global_row * (params.head_dim / 2) + (d / 2);
+                
+                float c = RotCos.data[rot_idx];
+                float s = RotSin.data[rot_idx];
+                
+                // We need the pair element.
+                // This is slightly inefficient as we might load the pair twice across threads/loops.
+                // But for a simple implementation it works.
+                // Better: Iterate by PAIRS (d+=2) if block_size allows.
+                
+                // To avoid redundant loads/complexity, we'll use a simplified check:
+                float pair_val;
+                if ((d % 2) == 0) {
+                    // We are X. We need Y (d+1).
+                    pair_val = Q.data[base_offset + global_row * params.head_dim + (d + 1)];
+                    // x' = x*c - y*s
+                    q_val = q_val * c - pair_val * s;
+                } else {
+                    // We are Y. We need X (d-1).
+                    pair_val = Q.data[base_offset + global_row * params.head_dim + (d - 1)];
+                    // y' = x*s + y*c
+                    q_val = pair_val * s + q_val * c;
+                }
+            }
         }
+        s_Q[local_row][d] = q_val;
     }
     barrier();
 
     // Number of K/V blocks to iterate over
-    uint num_kv_blocks = (params.seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    uint num_kv_blocks = (params.key_seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     // Iterate over K/V blocks (the outer loop of FlashAttention)
     for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
         uint kv_start = kv_block * BLOCK_SIZE;
         uint kv_row = kv_start + local_row;
-        bool kv_valid = kv_row < params.seq_len;
+        bool kv_valid = kv_row < params.key_seq_len;
 
-        // Load K tile into shared memory
+    // Load K tile into shared memory
         for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+            float k_val = 0.0;
             if (kv_valid && batch_idx < params.batch_size) {
-                s_K[local_row][d] = K.data[base_offset + kv_row * params.head_dim + d];
-            } else {
-                s_K[local_row][d] = 0.0;
+                uint k_idx = ks_off + kv_row * params.head_dim + d;
+                k_val = K.data[k_idx];
+                
+                // Apply RoPE to K
+                if (params.has_rope != 0u) {
+                    uint rot_idx = kv_row * (params.head_dim / 2) + (d / 2);
+                    float c = RotCos.data[rot_idx];
+                    float s = RotSin.data[rot_idx];
+                    
+                    bool is_even = (d % 2 == 0);
+                    uint pair_d = is_even ? d + 1 : d - 1;
+                    uint pair_idx = ks_off + kv_row * params.head_dim + pair_d;
+                    float k_pair = K.data[pair_idx];
+                    
+                    if (is_even) {
+                        k_val = k_val * c - k_pair * s;
+                    } else {
+                        k_val = k_pair * s + k_val * c;
+                    }
+                }
             }
+            s_K[local_row][d] = k_val;
         }
 
-        // Load V tile into shared memory
+    // Load V tile into shared memory - Access V buffer
         for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+            float v_val = 0.0;
             if (kv_valid && batch_idx < params.batch_size) {
-                s_V[local_row][d] = V.data[base_offset + kv_row * params.head_dim + d];
-            } else {
-                s_V[local_row][d] = 0.0;
+                v_val = V.data[vs_off + kv_row * params.head_dim + d];
             }
+            s_V[local_row][d] = v_val;
         }
         barrier();
 
@@ -117,7 +202,7 @@ void main() {
 
         // Mask out-of-bounds positions AND apply causal mask
         uint global_col = kv_start + local_col;
-        bool is_masked = !is_active || global_col >= params.seq_len;
+        bool is_masked = !is_active || global_col >= params.key_seq_len;
 
         // Causal masking: mask positions where key_pos > query_pos
         if (params.causal != 0u && global_col > global_row) {
@@ -168,11 +253,11 @@ void main() {
         barrier();
     }
 
-    // Final normalization and write output
-    if (is_active) {
+    // Final normalization    // Write output to global memory
+    if (is_active && batch_idx < params.batch_size) {
         float inv_sum = 1.0 / row_sum;
-        for (uint d = 0; d < actual_head_dim; d++) {
-            O.data[base_offset + global_row * params.head_dim + d] = output_acc[d] * inv_sum;
+        for (uint d = local_col; d < actual_head_dim; d += BLOCK_SIZE) {
+            O.data[qs_off + global_row * params.head_dim + d] = output_acc[d] * inv_sum;
         }
     }
 }

@@ -94,6 +94,8 @@ pub const AttentionEngine = struct {
         K: *const GpuTensor,
         V: *const GpuTensor,
         output: *GpuTensor,
+        rot_cos: ?*const GpuTensor,
+        rot_sin: ?*const GpuTensor,
         causal: bool,
     ) !void {
         // Validate shapes match
@@ -106,17 +108,21 @@ pub const AttentionEngine = struct {
         const seq_len = Q.shape[2];
         const head_dim = Q.shape[3];
 
-        // Verify all shapes match
-        if (K.shape[0] != batch_size or K.shape[1] != num_heads or
-            K.shape[2] != seq_len or K.shape[3] != head_dim)
+        // Verify all shapes match (GQA: K/V heads can be divisor of Q heads)
+        // K.shape[1] (num_kv_heads) must divide num_heads
+        if (K.shape[0] != batch_size or 
+            (num_heads % K.shape[1] != 0) or
+            K.shape[3] != head_dim)
         {
             return error.ShapeMismatch;
         }
-        if (V.shape[0] != batch_size or V.shape[1] != num_heads or
-            V.shape[2] != seq_len or V.shape[3] != head_dim)
+        if (V.shape[0] != batch_size or V.shape[1] != K.shape[1] or
+            V.shape[2] != K.shape[2] or 
+            V.shape[3] != head_dim)
         {
             return error.ShapeMismatch;
         }
+        // Output must match Query shape
         if (output.shape[0] != batch_size or output.shape[1] != num_heads or
             output.shape[2] != seq_len or output.shape[3] != head_dim)
         {
@@ -126,6 +132,26 @@ pub const AttentionEngine = struct {
         if (head_dim > 64) {
             return error.HeadDimTooLarge;
         }
+        
+        // RoPE validation
+        var rope_size: u64 = 0;
+        var has_rope = false;
+        var cos_buf: ?vk.Buffer = null;
+        var sin_buf: ?vk.Buffer = null;
+        
+        if (rot_cos) |c| {
+            if (rot_sin) |s| {
+                has_rope = true;
+                rope_size = c.byteSize();
+                cos_buf = c.getBuffer();
+                sin_buf = s.getBuffer();
+                // Minimal validation: assume user provides correct shape for now
+            } else {
+                return error.MissingRotarySin;
+            }
+        } else if (rot_sin != null) {
+            return error.MissingRotaryCos;
+        }
 
         // Update descriptors to point to the GPU tensors
         self.pipeline.updateDescriptors(
@@ -133,11 +159,17 @@ pub const AttentionEngine = struct {
             K.getBuffer(),
             V.getBuffer(),
             output.getBuffer(),
+            cos_buf,
+            sin_buf,
             Q.byteSize(),
+            rope_size,
         );
 
+        const num_kv_heads = K.shape[1];
+        const key_seq_len = K.shape[2];
+
         // Dispatch - data stays on GPU!
-        try self.pipeline.dispatch(batch_size, num_heads, seq_len, head_dim, causal);
+        try self.pipeline.dispatch(batch_size, num_heads, num_kv_heads, seq_len, key_seq_len, head_dim, causal, has_rope);
     }
 
     /// Convenience: forward with automatic sync
@@ -147,9 +179,11 @@ pub const AttentionEngine = struct {
         K: *const GpuTensor,
         V: *const GpuTensor,
         output: *GpuTensor,
+        rot_cos: ?*const GpuTensor,
+        rot_sin: ?*const GpuTensor,
         causal: bool,
     ) !void {
-        try self.forward(Q, K, V, output, causal);
+        try self.forward(Q, K, V, output, rot_cos, rot_sin, causal);
         try self.ctx.waitIdle();
     }
 

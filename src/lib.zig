@@ -239,7 +239,7 @@ export fn aule_attention_forward(
     ctx.upload(v_ptr, value[0..count]) catch |err| { setError("Upload V failed: {}", .{err}); return -3; };
 
     // 3. Compute
-    ctx.attention(q_ptr, k_ptr, v_ptr, o_ptr, causal != 0) catch |err| {
+    ctx.attention(q_ptr, k_ptr, v_ptr, o_ptr, null, null, causal != 0) catch |err| {
         setError("Attention failed: {}", .{err});
         return -4;
     };
@@ -327,6 +327,8 @@ export fn aule_attention_forward_gpu(
     k_handle: TensorHandle,
     v_handle: TensorHandle,
     output_handle: TensorHandle,
+    rot_cos_handle: TensorHandle,
+    rot_sin_handle: TensorHandle,
     causal: i32,
 ) callconv(.C) i32 {
     var ctx = global_ctx orelse return -1;
@@ -335,8 +337,19 @@ export fn aule_attention_forward_gpu(
     const k = tensor_storage[@intCast(k_handle - 1)] orelse return -1;
     const v = tensor_storage[@intCast(v_handle - 1)] orelse return -1;
     const o = tensor_storage[@intCast(output_handle - 1)] orelse return -1;
+    
+    // Optional handles (0 means null)
+    var rot_cos: ?*Tensor = null;
+    if (rot_cos_handle != 0) {
+        rot_cos = tensor_storage[@intCast(rot_cos_handle - 1)];
+    }
+    
+    var rot_sin: ?*Tensor = null;
+    if (rot_sin_handle != 0) {
+        rot_sin = tensor_storage[@intCast(rot_sin_handle - 1)];
+    }
 
-    ctx.attention(q, k, v, o, causal != 0) catch |err| {
+    ctx.attention(q, k, v, o, rot_cos, rot_sin, causal != 0) catch |err| {
         setError("Attention failed: {}", .{err});
         return -3;
     };

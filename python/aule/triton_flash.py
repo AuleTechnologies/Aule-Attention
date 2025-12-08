@@ -11,6 +11,7 @@ Features:
 - MQA (Multi-Query Attention) support
 - Sliding window attention
 - Causal and non-causal masking
+- Fused RoPE (Rotary Position Embedding)
 - fp16, bf16, fp32 support
 - AMD wavefront-optimized block sizes
 
@@ -24,17 +25,50 @@ import math
 
 
 # =============================================================================
-# FORWARD KERNEL
+# ROPE HELPERS
+# =============================================================================
+
+@triton.jit
+def _apply_rope(x, cos, sin, BLOCK_K: tl.constexpr):
+    """Apply rotary position embedding to a tensor.
+
+    x: [BLOCK_M/N, BLOCK_K] - query or key block
+    cos, sin: [BLOCK_M/N, BLOCK_K] - precomputed cos/sin for positions
+
+    RoPE formula for each pair (x[i], x[i+d/2]):
+        x_rot[i]     = x[i] * cos[i] - x[i+d/2] * sin[i]
+        x_rot[i+d/2] = x[i] * sin[i] + x[i+d/2] * cos[i]
+    """
+    # Split into first half and second half
+    half_k = BLOCK_K // 2
+    x1 = x[:, :half_k]
+    x2 = x[:, half_k:]
+    cos1 = cos[:, :half_k]
+    sin1 = sin[:, :half_k]
+
+    # Rotate
+    o1 = x1 * cos1 - x2 * sin1
+    o2 = x1 * sin1 + x2 * cos1
+
+    # Concatenate back - use explicit indexing
+    # Note: tl.join not available in all Triton versions, so we write back directly
+    return o1, o2
+
+
+# =============================================================================
+# FORWARD KERNEL (WITH OPTIONAL ROPE)
 # =============================================================================
 
 @triton.jit
 def _flash_attn_fwd_kernel(
     Q, K, V, Out, L,  # L stores logsumexp for backward
+    Cos, Sin,  # RoPE cos/sin buffers (can be None via USE_ROPE=False)
     stride_qb, stride_qh, stride_qm, stride_qk,
     stride_kb, stride_kh, stride_kn, stride_kk,
     stride_vb, stride_vh, stride_vn, stride_vk,
     stride_ob, stride_oh, stride_om, stride_ok,
     stride_lb, stride_lh, stride_lm,
+    stride_cos_s, stride_cos_d,  # RoPE strides
     num_heads_q, num_heads_kv,
     seq_len_q, seq_len_k, head_dim,
     scale,
@@ -44,8 +78,9 @@ def _flash_attn_fwd_kernel(
     BLOCK_K: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     STORE_LSE: tl.constexpr,  # Whether to store logsumexp for backward
+    USE_ROPE: tl.constexpr,  # Whether to apply RoPE
 ):
-    """FlashAttention-2 forward kernel with GQA and sliding window support."""
+    """FlashAttention-2 forward kernel with GQA, sliding window, and fused RoPE support."""
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
 
@@ -72,6 +107,25 @@ def _flash_attn_fwd_kernel(
     # Load Q
     q_mask = (offs_m[:, None] < seq_len_q) & (offs_k[None, :] < head_dim)
     q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
+
+    # Apply RoPE to Q if enabled
+    if USE_ROPE:
+        # Load cos/sin for Q positions
+        half_k = BLOCK_K // 2
+        offs_k_half = tl.arange(0, half_k)
+        cos_q_ptrs = Cos + offs_m[:, None] * stride_cos_s + offs_k_half[None, :] * stride_cos_d
+        sin_q_ptrs = Sin + offs_m[:, None] * stride_cos_s + offs_k_half[None, :] * stride_cos_d
+        cos_mask = (offs_m[:, None] < seq_len_q) & (offs_k_half[None, :] < head_dim // 2)
+        cos_q = tl.load(cos_q_ptrs, mask=cos_mask, other=1.0).to(tl.float32)
+        sin_q = tl.load(sin_q_ptrs, mask=cos_mask, other=0.0).to(tl.float32)
+
+        # Apply rotation: q1' = q1*cos - q2*sin, q2' = q1*sin + q2*cos
+        q1 = q[:, :half_k]
+        q2 = q[:, half_k:BLOCK_K]
+        q1_rot = q1 * cos_q - q2 * sin_q
+        q2_rot = q1 * sin_q + q2 * cos_q
+        # Reassemble q (write back to registers)
+        q = tl.join(q1_rot, q2_rot)
 
     # Determine KV range
     if IS_CAUSAL:
@@ -104,6 +158,23 @@ def _flash_attn_fwd_kernel(
         kv_mask = (offs_n_curr[:, None] < seq_len_k) & (offs_k[None, :] < head_dim)
         k = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
         v = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+
+        # Apply RoPE to K if enabled
+        if USE_ROPE:
+            half_k = BLOCK_K // 2
+            offs_k_half = tl.arange(0, half_k)
+            cos_k_ptrs = Cos + offs_n_curr[:, None] * stride_cos_s + offs_k_half[None, :] * stride_cos_d
+            sin_k_ptrs = Sin + offs_n_curr[:, None] * stride_cos_s + offs_k_half[None, :] * stride_cos_d
+            cos_k_mask = (offs_n_curr[:, None] < seq_len_k) & (offs_k_half[None, :] < head_dim // 2)
+            cos_k = tl.load(cos_k_ptrs, mask=cos_k_mask, other=1.0).to(tl.float32)
+            sin_k = tl.load(sin_k_ptrs, mask=cos_k_mask, other=0.0).to(tl.float32)
+
+            # Apply rotation: k1' = k1*cos - k2*sin, k2' = k1*sin + k2*cos
+            k1 = k[:, :half_k]
+            k2 = k[:, half_k:BLOCK_K]
+            k1_rot = k1 * cos_k - k2 * sin_k
+            k2_rot = k1 * sin_k + k2 * cos_k
+            k = tl.join(k1_rot, k2_rot)
 
         # Attention scores
         s = tl.dot(q, tl.trans(k)) * scale
@@ -296,7 +367,7 @@ def _compute_delta_kernel(
 
 class FlashAttentionTritonFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, causal=True, scale=None, window_size=-1):
+    def forward(ctx, q, k, v, causal=True, scale=None, window_size=-1, cos=None, sin=None):
         batch, heads_q, seq_len_q, head_dim = q.shape
         _, heads_kv, seq_len_k, _ = k.shape
 
@@ -310,6 +381,27 @@ class FlashAttentionTritonFunc(torch.autograd.Function):
         q = q.contiguous().float()
         k = k.contiguous().float()
         v = v.contiguous().float()
+
+        # RoPE handling
+        use_rope = cos is not None and sin is not None
+        if use_rope:
+            assert cos.shape[-1] == head_dim // 2, f"cos must have shape [..., {head_dim // 2}], got {cos.shape}"
+            assert sin.shape[-1] == head_dim // 2, f"sin must have shape [..., {head_dim // 2}], got {sin.shape}"
+            cos = cos.contiguous().float()
+            sin = sin.contiguous().float()
+            # Ensure 2D: [max_seq_len, head_dim // 2]
+            if cos.dim() == 3:
+                cos = cos.squeeze(0)
+            if sin.dim() == 3:
+                sin = sin.squeeze(0)
+            stride_cos_s = cos.stride(0)
+            stride_cos_d = cos.stride(1)
+        else:
+            # Dummy tensors for kernel (won't be accessed when USE_ROPE=False)
+            cos = torch.empty(1, 1, device=q.device, dtype=torch.float32)
+            sin = torch.empty(1, 1, device=q.device, dtype=torch.float32)
+            stride_cos_s = 0
+            stride_cos_d = 0
 
         out = torch.empty_like(q)
 
@@ -329,16 +421,18 @@ class FlashAttentionTritonFunc(torch.autograd.Function):
 
         _flash_attn_fwd_kernel[grid](
             q, k, v, out, L,
+            cos, sin,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
             L.stride(0), L.stride(1), L.stride(2),
+            stride_cos_s, stride_cos_d,
             heads_q, heads_kv,
             seq_len_q, seq_len_k, head_dim,
             scale, window_size,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-            IS_CAUSAL=causal, STORE_LSE=True,
+            IS_CAUSAL=causal, STORE_LSE=True, USE_ROPE=use_rope,
         )
 
         ctx.save_for_backward(q, k, v, out, L)
@@ -401,7 +495,7 @@ class FlashAttentionTritonFunc(torch.autograd.Function):
             IS_CAUSAL=causal,
         )
 
-        return dq.to(ctx.orig_dtype), dk.to(ctx.orig_dtype), dv.to(ctx.orig_dtype), None, None, None
+        return dq.to(ctx.orig_dtype), dk.to(ctx.orig_dtype), dv.to(ctx.orig_dtype), None, None, None, None, None
 
 
 def flash_attention_triton(
@@ -436,6 +530,51 @@ def flash_attention_triton(
     return FlashAttentionTritonFunc.apply(q, k, v, causal, scale, window_size)
 
 
+def flash_attention_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    causal: bool = True,
+    scale: float = None,
+    window_size: int = -1,
+) -> torch.Tensor:
+    """
+    Fused RoPE + FlashAttention-2 in a single kernel.
+
+    This applies Rotary Position Embedding to Q and K inside the attention
+    kernel, avoiding separate memory round-trips for RoPE. This is more
+    efficient than applying RoPE separately before attention.
+
+    Args:
+        q: Query [batch, heads_q, seq_len_q, head_dim]
+        k: Key [batch, heads_kv, seq_len_k, head_dim]
+        v: Value [batch, heads_kv, seq_len_k, head_dim]
+        cos: Cosine frequencies [seq_len, head_dim // 2] or [1, seq_len, head_dim // 2]
+        sin: Sine frequencies [seq_len, head_dim // 2] or [1, seq_len, head_dim // 2]
+        causal: Apply causal masking (default True)
+        scale: Attention scale (default: 1/sqrt(head_dim))
+        window_size: Sliding window size (-1 for full attention)
+
+    Returns:
+        Output [batch, heads_q, seq_len_q, head_dim]
+
+    Note:
+        RoPE is applied as: x_rot = x * cos + rotate_half(x) * sin
+        Where rotate_half swaps the two halves of the head dimension with negation.
+    """
+    assert q.dim() == 4
+    assert k.dim() == 4 and v.dim() == 4
+    assert q.shape[-1] == k.shape[-1] == v.shape[-1]
+    assert k.shape[1] == v.shape[1]
+    assert k.shape[2] == v.shape[2]
+    assert q.shape[1] % k.shape[1] == 0
+    assert cos is not None and sin is not None, "cos and sin are required for RoPE"
+
+    return FlashAttentionTritonFunc.apply(q, k, v, causal, scale, window_size, cos, sin)
+
+
 def is_triton_available() -> bool:
     """Check if Triton is available."""
     try:
@@ -448,6 +587,72 @@ def is_triton_available() -> bool:
 
 # Alias
 flash_attention = flash_attention_triton
+
+
+# =============================================================================
+# ROPE HELPERS
+# =============================================================================
+
+def precompute_rope_frequencies(
+    seq_len: int,
+    head_dim: int,
+    base: float = 10000.0,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float32,
+):
+    """
+    Precompute RoPE cos/sin frequencies.
+
+    Args:
+        seq_len: Maximum sequence length
+        head_dim: Attention head dimension
+        base: RoPE base frequency (default 10000.0)
+        device: Device to put tensors on
+        dtype: Data type for the frequencies
+
+    Returns:
+        cos, sin: Tensors of shape [seq_len, head_dim // 2]
+    """
+    # Compute frequencies: theta_i = base^(-2i/d) for i in 0..d/2
+    half_dim = head_dim // 2
+    freqs = 1.0 / (base ** (torch.arange(0, half_dim, device=device, dtype=dtype) / half_dim))
+
+    # Compute positions
+    positions = torch.arange(seq_len, device=device, dtype=dtype)
+
+    # Outer product: [seq_len, half_dim]
+    angles = positions[:, None] * freqs[None, :]
+
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+
+    return cos, sin
+
+
+def apply_rope_separate(q, k, cos, sin):
+    """
+    Apply RoPE to Q and K separately (for comparison/reference).
+
+    This is the standard non-fused implementation.
+    """
+    def rotate_half(x):
+        x1 = x[..., :x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat([-x2, x1], dim=-1)
+
+    seq_len = q.shape[2]
+    # Expand cos/sin to match q/k shape: [1, 1, seq_len, head_dim // 2]
+    cos = cos[:seq_len].unsqueeze(0).unsqueeze(0)
+    sin = sin[:seq_len].unsqueeze(0).unsqueeze(0)
+
+    # Expand to full head_dim by concatenating
+    cos_full = torch.cat([cos, cos], dim=-1)
+    sin_full = torch.cat([sin, sin], dim=-1)
+
+    q_rotated = q * cos_full + rotate_half(q) * sin_full
+    k_rotated = k * cos_full + rotate_half(k) * sin_full
+
+    return q_rotated, k_rotated
 
 
 # =============================================================================
@@ -528,6 +733,36 @@ if __name__ == "__main__":
     k = torch.randn(1, 4, 64, 64, device=device, dtype=torch.float32)
     v = torch.randn(1, 4, 64, 64, device=device, dtype=torch.float32)
     results.append(test("Non-causal", q, k, v, causal=False))
+
+    # --- Fused RoPE Tests ---
+    print("\n--- Fused RoPE + Attention Tests ---")
+
+    def test_rope(name, batch, heads, seq_len, head_dim, causal=True, rtol=1e-2):
+        """Test fused RoPE against separate RoPE + attention."""
+        q = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.float32)
+        k = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.float32)
+        v = torch.randn(batch, heads, seq_len, head_dim, device=device, dtype=torch.float32)
+
+        # Precompute frequencies
+        cos, sin = precompute_rope_frequencies(seq_len, head_dim, device=device)
+
+        # Reference: separate RoPE + attention
+        q_rot, k_rot = apply_rope_separate(q, k, cos, sin)
+        out_ref = F.scaled_dot_product_attention(q_rot, k_rot, v, is_causal=causal)
+
+        # Fused: RoPE + attention in one kernel
+        out_fused = flash_attention_rope(q, k, v, cos, sin, causal=causal)
+
+        diff = (out_fused - out_ref).abs().max().item()
+        ok = diff < rtol
+
+        status = "PASS" if ok else "FAIL"
+        print(f"{status}: {name} | diff={diff:.6f}")
+        return ok
+
+    results.append(test_rope("Fused RoPE (64 dim)", 2, 8, 64, 64))
+    results.append(test_rope("Fused RoPE (128 dim)", 1, 8, 32, 128))
+    results.append(test_rope("Fused RoPE (non-causal)", 1, 4, 64, 64, causal=False))
 
     print(f"\n{'=' * 60}")
     print(f"Results: {sum(results)}/{len(results)} passed")

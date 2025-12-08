@@ -14,6 +14,9 @@ pub const AttentionPushConstants = extern struct {
     head_dim: u32,
     scale: f32,
     causal: u32, // 1 for causal masking (LLMs), 0 for bidirectional
+    has_rope: u32, // 1 to apply RoPE, 0 to skip
+    num_kv_heads: u32, // Number of K/V heads
+    key_seq_len: u32, // Sequence length of K/V
 };
 
 pub const AttentionPipeline = struct {
@@ -85,6 +88,20 @@ pub const AttentionPipeline = struct {
                 .stage_flags = .{ .compute_bit = true },
                 .p_immutable_samplers = null,
             },
+            .{
+                .binding = 4,
+                .descriptor_type = .storage_buffer,
+                .descriptor_count = 1,
+                .stage_flags = .{ .compute_bit = true },
+                .p_immutable_samplers = null,
+            },
+            .{
+                .binding = 5,
+                .descriptor_type = .storage_buffer,
+                .descriptor_count = 1,
+                .stage_flags = .{ .compute_bit = true },
+                .p_immutable_samplers = null,
+            },
         };
 
         const descriptor_set_layout = try ctx.vkd.createDescriptorSetLayout(ctx.device, &.{
@@ -135,7 +152,7 @@ pub const AttentionPipeline = struct {
         // Descriptor pool
         const pool_size = vk.DescriptorPoolSize{
             .type = .storage_buffer,
-            .descriptor_count = 4,
+            .descriptor_count = 6,
         };
 
         const descriptor_pool = try ctx.vkd.createDescriptorPool(ctx.device, &.{
@@ -202,13 +219,24 @@ pub const AttentionPipeline = struct {
         k_buffer: vk.Buffer,
         v_buffer: vk.Buffer,
         o_buffer: vk.Buffer,
+        rot_cos_buffer: ?vk.Buffer,
+        rot_sin_buffer: ?vk.Buffer,
         size: vk.DeviceSize,
+        rope_size: vk.DeviceSize,
     ) void {
+        const valid_rope_size = if (rope_size > 0) rope_size else 64; // Fallback size for valid validation if null
+        // We must provide valid handles even if unused, due to descriptor set layout.
+        // If null, we reuse q_buffer (safe because we won't read it if has_rope=0).
+        const cos_buf = if (rot_cos_buffer) |b| b else q_buffer;
+        const sin_buf = if (rot_sin_buffer) |b| b else q_buffer;
+        
         const buffer_infos = [_]vk.DescriptorBufferInfo{
             .{ .buffer = q_buffer, .offset = 0, .range = size },
             .{ .buffer = k_buffer, .offset = 0, .range = size },
             .{ .buffer = v_buffer, .offset = 0, .range = size },
             .{ .buffer = o_buffer, .offset = 0, .range = size },
+            .{ .buffer = cos_buf, .offset = 0, .range = valid_rope_size },
+            .{ .buffer = sin_buf, .offset = 0, .range = valid_rope_size },
         };
 
         const writes = [_]vk.WriteDescriptorSet{
@@ -252,6 +280,26 @@ pub const AttentionPipeline = struct {
                 .p_buffer_info = @ptrCast(&buffer_infos[3]),
                 .p_texel_buffer_view = undefined,
             },
+            .{
+                .dst_set = self.descriptor_set,
+                .dst_binding = 4,
+                .dst_array_element = 0,
+                .descriptor_count = 1,
+                .descriptor_type = .storage_buffer,
+                .p_image_info = undefined,
+                .p_buffer_info = @ptrCast(&buffer_infos[4]),
+                .p_texel_buffer_view = undefined,
+            },
+            .{
+                .dst_set = self.descriptor_set,
+                .dst_binding = 5,
+                .dst_array_element = 0,
+                .descriptor_count = 1,
+                .descriptor_type = .storage_buffer,
+                .p_image_info = undefined,
+                .p_buffer_info = @ptrCast(&buffer_infos[5]),
+                .p_texel_buffer_view = undefined,
+            },
         };
 
         self.ctx.vkd.updateDescriptorSets(self.ctx.device, writes.len, &writes, 0, null);
@@ -261,9 +309,12 @@ pub const AttentionPipeline = struct {
         self: *const Self,
         batch_size: u32,
         num_heads: u32,
+        num_kv_heads: u32,
         seq_len: u32,
+        key_seq_len: u32,
         head_dim: u32,
         causal: bool,
+        has_rope: bool,
     ) !void {
         const push_constants = AttentionPushConstants{
             .batch_size = batch_size,
@@ -272,6 +323,9 @@ pub const AttentionPipeline = struct {
             .head_dim = head_dim,
             .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))),
             .causal = if (causal) 1 else 0,
+            .has_rope = if (has_rope) 1 else 0,
+            .num_kv_heads = num_kv_heads,
+            .key_seq_len = key_seq_len,
         };
 
         // Workgroup dimensions
