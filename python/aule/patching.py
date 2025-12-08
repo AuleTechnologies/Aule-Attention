@@ -3,6 +3,15 @@ import torch
 import warnings
 # from . import flash_attention # Circular import fix: imported inside function
 
+# Global configuration applied to all patches
+# Ideally this would be per-model, but for ComfyUI single-model usage this is safe
+# DEFAULT: causal=False for diffusion models (SD, FLUX, etc.)
+# For LLMs (GPT-2, Llama), explicitly set causal=True when patching
+PATCH_CONFIG = {
+    "causal": False,   # Default to False (diffusion/bidirectional attention)
+    "use_rope": False  # Default to False
+}
+
 def _aule_gpt2_forward(self, hidden_states, layer_past=None, attention_mask=None, head_mask=None, encoder_hidden_states=None, encoder_attention_mask=None, use_cache=False, output_attentions=False, past_key_values=None, **kwargs):
     """
     Monkey-patched forward pass for GPT2Attention using Aule FlashAttention.
@@ -39,7 +48,12 @@ def _aule_gpt2_forward(self, hidden_states, layer_past=None, attention_mask=None
 
     # Invoke Aule (Vulkan Backend)
     from . import flash_attention
-    attn_output = flash_attention(query, key, value, causal=True)
+    
+    # Read config
+    causal = PATCH_CONFIG.get("causal", False)  # Default False for diffusion models
+    # TODO: Pass use_rope when shader supports it
+    
+    attn_output = flash_attention(query, key, value, causal=causal)
     
     # Ensure tensor output (Vulkan backend fix included in __init__.py but doubling safety here)
     if not isinstance(attn_output, torch.Tensor):
@@ -86,17 +100,22 @@ def _patch_gpt2(model):
     target_class.forward = _aule_gpt2_forward
 
 
-def patch_model(model):
+def patch_model(model, config=None):
     """
     Automatically patch a Hugging Face model to use Aule FlashAttention.
     
     Args:
         model: A transformers.PreTrainedModel instance or class.
+        config: Optional dict overriding defaults {"causal": bool, "use_rope": bool}
     
     Supported Models:
         - GPT-2
     """
     model_type = getattr(model.config, "model_type", None) if hasattr(model, "config") else None
+    
+    if config:
+        print(f"Aule: Applying patch config: {config}")
+        PATCH_CONFIG.update(config)
     
     if model_type == "gpt2":
         _patch_gpt2(model)

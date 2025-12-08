@@ -102,6 +102,8 @@ class AulePatchModel:
         return {
             "required": {
                 "model": ("MODEL",),
+                "causal": ("BOOLEAN", {"default": False, "label_on": "True (LLM)", "label_off": "False (Diffusion)"}),
+                "use_rope": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -109,9 +111,20 @@ class AulePatchModel:
     FUNCTION = "patch"
     CATEGORY = "aule"
 
-    def patch(self, model):
-        # Install globally - affects this and all subsequent models
-        aule.install()
+    def patch(self, model, causal, use_rope):
+        print(f"Aule: Patching ComfyUI model... {model}")
+        
+        config = {
+            "causal": causal,
+            "use_rope": use_rope
+        }
+        try:
+            raw_model = model.model
+        except AttributeError:
+            raw_model = model # Maybe it is already raw?
+            
+        aule.patch_model(raw_model, config=config)
+        
         return (model,)
 
 
