@@ -87,7 +87,11 @@ pub fn build(b: *std.Build) void {
     lib.root_module.addAnonymousImport("attention_fwd_lse_spv", .{
         .root_source_file = attention_fwd_lse_spv,
     });
-    lib.linkSystemLibrary("vulkan");
+    // Link Vulkan on native builds only - cross-compilation uses runtime dynamic loading
+    const is_native = target.query.isNative();
+    if (is_native) {
+        lib.linkSystemLibrary("vulkan");
+    }
     lib.linkLibC();
 
     b.installArtifact(lib);

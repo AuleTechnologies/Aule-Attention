@@ -324,8 +324,14 @@ var vk_lib: ?std.DynLib = null;
 
 fn getLoaderFn() vk.PfnGetInstanceProcAddr {
     if (vk_lib == null) {
-        vk_lib = std.DynLib.open("libvulkan.so.1") catch |err| {
-            log.err("Failed to load Vulkan library: {}", .{err});
+        const builtin = @import("builtin");
+        const lib_name = switch (builtin.os.tag) {
+            .windows => "vulkan-1.dll",
+            .macos => "libvulkan.1.dylib",
+            else => "libvulkan.so.1",
+        };
+        vk_lib = std.DynLib.open(lib_name) catch |err| {
+            log.err("Failed to load Vulkan library ({s}): {}", .{ lib_name, err });
             @panic("Failed to load Vulkan");
         };
     }

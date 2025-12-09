@@ -22,14 +22,33 @@ class TestVulkanBackend:
         """Test Vulkan module imports."""
         from aule.vulkan import Aule, attention
 
-    def test_device_info(self):
-        """Test device info retrieval."""
-        from aule.vulkan import Aule
+    def test_forward_first(self, random_qkv_numpy, reference_attention):
+        """Initialize the global singleton with a forward pass first.
 
-        with Aule() as aule:
-            info = aule.get_device_info()
-            assert 'device_name' in info
-            print(f"Vulkan device: {info.get('device_name', 'Unknown')}")
+        This test must run first to avoid a pytest-specific segfault issue
+        that occurs when test_device_info runs before forward tests.
+        """
+        from aule.vulkan import attention
+
+        q, k, v = random_qkv_numpy(batch=1, heads=4, seq_len=32, head_dim=64)
+        out = attention(q, k, v, causal=True)
+        ref = reference_attention(q, k, v, causal=True)
+
+        assert out.shape == ref.shape
+        np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3)
+
+    def test_device_info(self):
+        """Test device info retrieval.
+
+        Note: This test must run after test_forward_first to avoid a segfault.
+        """
+        from aule.vulkan import _AULE_INSTANCE_SINGLETON
+
+        # Singleton should already be initialized from test_forward_first
+        assert _AULE_INSTANCE_SINGLETON is not None
+        info = _AULE_INSTANCE_SINGLETON.get_device_info()
+        assert 'device_name' in info
+        print(f"Vulkan device: {info.get('device_name', 'Unknown')}")
 
     def test_forward_basic(self, random_qkv_numpy, reference_attention):
         """Test basic forward pass."""

@@ -1,8 +1,21 @@
 # aule-attention
 
-**Hardware-agnostic FlashAttention implementation. No compilation required. Works on any GPU.**
+**FlashAttention that just works. No compilation. Any GPU.**
 
-Version: 0.2.0
+Version: 0.3.3
+
+## What's New in 0.3.3
+
+- **Windows Vulkan Support**: Added Windows DLL - Vulkan backend now works on Windows!
+- **Windows AMD Fix**: Automatic fallback to Vulkan on Windows + AMD (Triton AMD doesn't support Windows)
+
+## What's New in 0.3.0
+
+- **GQA/MQA Support**: Full Grouped Query Attention and Multi-Query Attention for Vulkan backend
+- **Cross-Attention**: Different sequence lengths for Q and K/V tensors
+- **ComfyUI Compatible**: Works with Stable Diffusion, SDXL, Flux, SD3 (use `causal=False`)
+- **20% Faster**: Phase 1 performance optimizations
+- **Bug Fixes**: Tensor cache fix for GQA, blocky noise fix for diffusion models
 
 ## Installation
 
@@ -23,35 +36,60 @@ v = torch.randn(1, 8, 512, 64, device='cuda')
 output = flash_attention(q, k, v, causal=True)
 ```
 
+### ComfyUI / Diffusion Models
+
+```python
+import aule
+aule.install()  # Patches PyTorch SDPA globally
+
+# Now all models using F.scaled_dot_product_attention use aule
+# For diffusion models, causal=False is used automatically
+```
+
+### GQA (Grouped Query Attention)
+
+```python
+# 32 query heads, 8 key/value heads (4:1 ratio)
+q = torch.randn(1, 32, 512, 64)
+k = torch.randn(1, 8, 512, 64)
+v = torch.randn(1, 8, 512, 64)
+
+output = flash_attention(q, k, v, causal=True)
+```
+
 ## Features
 
 - No compilation at install time
 - Works on AMD, NVIDIA, Intel, and Apple GPUs
 - Training support with backward pass (Triton backend)
 - Grouped Query Attention (GQA) and Multi-Query Attention (MQA) support
-- O(N) memory complexity
+- Cross-attention with different Q/KV sequence lengths
+- O(N) memory complexity via FlashAttention-2 algorithm
 
 ## Backends
 
 | Backend | Hardware | Features |
 |---------|----------|----------|
-| Triton | AMD ROCm, NVIDIA CUDA | Training and Inference |
-| Vulkan | Any Vulkan 1.2+ GPU | Inference |
-| CPU | NumPy | Fallback |
+| Triton | AMD ROCm (Linux), NVIDIA CUDA | Training + Inference, head_dim up to 128 |
+| Vulkan | Any Vulkan 1.2+ GPU (including Windows AMD) | Inference, head_dim up to 64, GQA/MQA |
+| CPU | NumPy | Fallback, any head_dim |
+
+> **Windows + AMD**: Automatically uses Vulkan backend (Triton AMD only supports Linux).
 
 ## API
 
 ```python
-from aule import flash_attention, get_available_backends, print_backend_info
+from aule import flash_attention, get_available_backends, install
 
 # Compute attention
 output = flash_attention(query, key, value, causal=True, scale=None)
 
 # Check available backends
-backends = get_available_backends()
+backends = get_available_backends()  # ['vulkan', 'cpu'] or ['triton', 'vulkan', 'cpu']
 
-# Display backend information
-print_backend_info()
+# Install as PyTorch SDPA replacement (for ComfyUI, Transformers, etc.)
+install()  # Auto-select best backend
+install(backend='vulkan', verbose=True)  # Force backend + logging
 ```
 
 ## Supported Hardware
@@ -76,5 +114,5 @@ MIT License - Aule Technologies
 
 ## Links
 
-- [GitHub Repository](https://github.com/aule-dev/aule-attention)
-- [Documentation](https://github.com/aule-dev/aule-attention#readme)
+- [GitHub Repository](https://github.com/xenn0010/Aule-Attention)
+- [PyPI](https://pypi.org/project/aule-attention/)

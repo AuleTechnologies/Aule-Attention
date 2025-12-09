@@ -42,9 +42,11 @@ def _find_library() -> Path:
     candidates = [
         # Installed package location
         Path(__file__).parent / "lib" / lib_name,
-        # Development paths
+        # Development paths (lib for Linux/macOS, bin for Windows DLLs)
         Path(__file__).parent.parent.parent / "zig-out" / "lib" / lib_name,
+        Path(__file__).parent.parent.parent / "zig-out" / "bin" / lib_name,
         Path(__file__).parent.parent / "zig-out" / "lib" / lib_name,
+        Path(__file__).parent.parent / "zig-out" / "bin" / lib_name,
         # System paths
         Path("/usr/local/lib") / lib_name,
         Path("/usr/lib") / lib_name,

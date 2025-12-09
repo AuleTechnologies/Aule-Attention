@@ -576,12 +576,32 @@ def flash_attention_rope(
 
 
 def is_triton_available() -> bool:
-    """Check if Triton is available."""
+    """Check if Triton is available and functional.
+
+    Note: Triton AMD backend doesn't work on Windows (uses Linux-specific ldconfig).
+    On Windows with AMD GPU, we return False to fall back to Vulkan.
+    """
     try:
         import triton
         import torch
-        return torch.cuda.is_available()
+        import sys
+
+        if not torch.cuda.is_available():
+            return False
+
+        # Check for Windows + AMD combination (Triton AMD doesn't work on Windows)
+        if sys.platform == 'win32':
+            # Check if this is an AMD GPU (ROCm presents as CUDA on Windows)
+            device_name = torch.cuda.get_device_name(0).lower()
+            if 'amd' in device_name or 'radeon' in device_name or 'gfx' in device_name:
+                # Triton AMD backend uses Linux-specific commands, doesn't work on Windows
+                return False
+
+        return True
     except ImportError:
+        return False
+    except Exception:
+        # Any error during detection means Triton isn't usable
         return False
 
 
