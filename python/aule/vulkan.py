@@ -586,26 +586,32 @@ class Aule:
             # Since convienence function uses `with Aule()`, they will be cleaned up.
             return output
 
-        # OPTIMIZED: Use cached GPU tensors to avoid buffer recreation (5-10x speedup)
-        shape_key = (batch_size, num_heads, seq_len, head_dim)
+        # For GQA and cross-attention, K/V may have different shapes than Q
+        q_shape = query.shape
+        k_shape = key.shape
+        v_shape = value.shape
+        out_shape = q_shape  # Output always matches Q shape
 
-        if shape_key not in self._tensor_cache:
-            # First call with this shape - create buffers (slow, but only once)
-            q_gpu = self.tensor(shape_key)
-            k_gpu = self.tensor(shape_key)
-            v_gpu = self.tensor(shape_key)
-            out_gpu = self.tensor(shape_key)
-            self._tensor_cache[shape_key] = (q_gpu, k_gpu, v_gpu, out_gpu)
+        # Cache key must include ALL shapes (Q, K, V can differ)
+        cache_key = (q_shape, k_shape, v_shape)
+
+        if cache_key not in self._tensor_cache:
+            # First call with this shape combination - create buffers
+            q_gpu = self.tensor(q_shape)
+            k_gpu = self.tensor(k_shape)
+            v_gpu = self.tensor(v_shape)
+            out_gpu = self.tensor(out_shape)
+            self._tensor_cache[cache_key] = (q_gpu, k_gpu, v_gpu, out_gpu)
         else:
-            # Reuse cached buffers (fast!)
-            q_gpu, k_gpu, v_gpu, out_gpu = self._tensor_cache[shape_key]
+            # Reuse cached buffers
+            q_gpu, k_gpu, v_gpu, out_gpu = self._tensor_cache[cache_key]
 
         # Upload data to GPU
         q_gpu.upload(query)
         k_gpu.upload(key)
         v_gpu.upload(value)
 
-        # Compute on GPU (no CPU↔GPU transfer during compute!)
+        # Compute on GPU
         self.attention_gpu(q_gpu, k_gpu, v_gpu, out_gpu, causal=causal)
 
         # Download result

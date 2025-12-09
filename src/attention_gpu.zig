@@ -162,11 +162,18 @@ pub const AttentionEngine = struct {
             cos_buf,
             sin_buf,
             Q.byteSize(),
+            K.byteSize(),
+            V.byteSize(),
+            output.byteSize(),
             rope_size,
         );
 
         const num_kv_heads = K.shape[1];
         const key_seq_len = K.shape[2];
+
+        log.info("Dispatching: B={d}, H={d}, KVH={d}, QLen={d}, KLen={d}", .{
+            batch_size, num_heads, num_kv_heads, seq_len, key_seq_len
+        });
 
         // Dispatch - data stays on GPU!
         try self.pipeline.dispatch(batch_size, num_heads, num_kv_heads, seq_len, key_seq_len, head_dim, causal, has_rope);

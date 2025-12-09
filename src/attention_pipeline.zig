@@ -221,7 +221,10 @@ pub const AttentionPipeline = struct {
         o_buffer: vk.Buffer,
         rot_cos_buffer: ?vk.Buffer,
         rot_sin_buffer: ?vk.Buffer,
-        size: vk.DeviceSize,
+        q_size: vk.DeviceSize,
+        k_size: vk.DeviceSize,
+        v_size: vk.DeviceSize,
+        o_size: vk.DeviceSize,
         rope_size: vk.DeviceSize,
     ) void {
         const valid_rope_size = if (rope_size > 0) rope_size else 64; // Fallback size for valid validation if null
@@ -231,10 +234,10 @@ pub const AttentionPipeline = struct {
         const sin_buf = if (rot_sin_buffer) |b| b else q_buffer;
         
         const buffer_infos = [_]vk.DescriptorBufferInfo{
-            .{ .buffer = q_buffer, .offset = 0, .range = size },
-            .{ .buffer = k_buffer, .offset = 0, .range = size },
-            .{ .buffer = v_buffer, .offset = 0, .range = size },
-            .{ .buffer = o_buffer, .offset = 0, .range = size },
+            .{ .buffer = q_buffer, .offset = 0, .range = q_size },
+            .{ .buffer = k_buffer, .offset = 0, .range = k_size },
+            .{ .buffer = v_buffer, .offset = 0, .range = v_size },
+            .{ .buffer = o_buffer, .offset = 0, .range = o_size },
             .{ .buffer = cos_buf, .offset = 0, .range = valid_rope_size },
             .{ .buffer = sin_buf, .offset = 0, .range = valid_rope_size },
         };
