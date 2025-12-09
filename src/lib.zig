@@ -673,8 +673,8 @@ pub const Attention = struct {
         try self.context.upload(k_ptr, K[0..count]);
         try self.context.upload(v_ptr, V[0..count]);
 
-        // 3. Compute
-        try self.context.attention(q_ptr, k_ptr, v_ptr, o_ptr, causal);
+        // 3. Compute (no RoPE for basic tests)
+        try self.context.attention(q_ptr, k_ptr, v_ptr, o_ptr, null, null, causal);
 
         // 4. Download
         try self.context.download(o_ptr, output[0..count]);
