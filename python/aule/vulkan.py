@@ -16,6 +16,9 @@ _LIBRARY_PATH: Optional[Path] = None
 # Global singleton to avoid reloading library on every Aule() call
 _AULE_LIB_SINGLETON = None
 
+# Track if aule_init() has been called
+_AULE_INITIALIZED = False
+
 # Global singleton Aule instance for standalone functions (shares tensor cache)
 _AULE_INSTANCE_SINGLETON = None
 
@@ -170,7 +173,7 @@ class Aule:
             library_path: Optional path to the aule shared library.
                          If None, uses the library found at import time.
         """
-        global _AULE_LIB_SINGLETON
+        global _AULE_LIB_SINGLETON, _AULE_INITIALIZED
 
         if library_path:
             lib_path = Path(library_path)
@@ -179,7 +182,6 @@ class Aule:
 
         # Use singleton to avoid reloading library (MAJOR performance fix)
         if _AULE_LIB_SINGLETON is None:
-            print(f"DEBUG: Loading Aule Library from {lib_path}")
             _AULE_LIB_SINGLETON = ctypes.CDLL(str(lib_path))
 
         self._lib = _AULE_LIB_SINGLETON
@@ -187,11 +189,13 @@ class Aule:
         self._tensors = []  # Track tensors for cleanup
         self._tensor_cache = {}  # Cache buffers by shape: (batch, heads, seq, dim) -> (Q, K, V, O)
 
-        # Initialize the library
-        result = self._lib.aule_init()
-        if result != 0:
-            error = self._lib.aule_get_error()
-            raise AuleError(f"Failed to initialize aule: {error.decode()}")
+        # Only call aule_init() once globally (avoid segfault on double-init)
+        if not _AULE_INITIALIZED:
+            result = self._lib.aule_init()
+            if result != 0:
+                error = self._lib.aule_get_error()
+                raise AuleError(f"Failed to initialize aule: {error.decode()}")
+            _AULE_INITIALIZED = True
 
         self._initialized = True
 
@@ -766,13 +770,18 @@ class Aule:
 
     def close(self):
         """Shut down the aule library and release GPU resources."""
+        global _AULE_INITIALIZED
         if self._initialized:
             # Clean up tensors
             for tensor in self._tensors:
                 tensor.destroy()
             self._tensors.clear()
+            self._tensor_cache.clear()
 
-            self._lib.aule_shutdown()
+            # Only shutdown if we're the singleton, otherwise just mark as not initialized
+            # Note: In practice with singletons, we don't want to actually shutdown
+            # because other code might still be using it. Only shutdown on program exit.
+            # self._lib.aule_shutdown()
             self._initialized = False
 
     def __enter__(self):
