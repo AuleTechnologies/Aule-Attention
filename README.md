@@ -373,6 +373,20 @@ sudo pacman -S vulkan-tools vulkan-icd-loader
 
 Reduce batch size or sequence length. While aule-attention uses O(N) memory instead of O(N^2), the input tensors (Q, K, V) still require GPU memory.
 
+## Security
+
+This project does not ship pre-built binaries in the git repository. This is a deliberate security decision to prevent supply chain attacks.
+
+**For users:**
+- Build from source using the instructions above, or
+- Download official releases from GitHub Releases (with published checksums)
+
+**For contributors:**
+- Never commit `.dll`, `.so`, `.dylib`, or `.spv` files to the repository
+- All binaries must be built in CI with full transparency
+
+If you find a binary file in this repository, please report it as a security issue.
+
 ## License
 
 MIT License

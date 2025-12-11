@@ -31,5 +31,13 @@ env/
 .DS_Store
 Thumbs.db
 
-# Keep the lib directory for the package but ignore .so files at root
-# python/aule/lib/ is intentionally tracked for distribution
+# Pre-built binaries - DO NOT commit binaries to git (supply chain security)
+# Users should build from source or download from trusted CI artifacts
+python/aule/lib/*.dll
+python/aule/lib/*.so
+python/aule/lib/*.dylib
+*.dll
+*.dylib
+
+# Compiled SPIR-V shaders (should be compiled from .comp source)
+shaders/*.spv
