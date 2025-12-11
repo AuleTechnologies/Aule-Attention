@@ -42,6 +42,10 @@ void main() {
     uint radius_val = 0;
     uint digit = 0;
     float key_val = 0.0;
+
+    // Initialize shared memory
+    local_histogram[lID] = 0;
+    barrier();
     
     // If within bounds
     bool active_thread = gID < num_elements;
@@ -194,4 +198,6 @@ void main() {
         // So we never move Keys/Vals.
         // We just keep permuting `inds`.
     }
+
+
 }

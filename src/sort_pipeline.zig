@@ -9,8 +9,9 @@ const log = std.log.scoped(.sort_pipeline);
 /// Push constants for spatial sort shader
 pub const SortPushConstants = extern struct {
     num_elements: u32,
-    d_model: u32,
+    shift: u32,   // Added for Radix
     sort_dim: u32,
+    d_model: u32,
 };
 
 pub const SortPipeline = struct {
@@ -220,45 +221,7 @@ pub const SortPipeline = struct {
         self.* = undefined;
     }
 
-    pub fn updateDescriptors(
-        self: *const Self,
-        keys_in: vk.Buffer,
-        vals_in: vk.Buffer,
-        inds_in: vk.Buffer,
-        keys_out: vk.Buffer,
-        vals_out: vk.Buffer,
-        inds_out: vk.Buffer,
-        histograms: vk.Buffer,
-        size: vk.DeviceSize,
-        hist_size: vk.DeviceSize,
-    ) void {
-        _ = hist_size;
-        const buffer_infos = [_]vk.DescriptorBufferInfo{
-            .{ .buffer = keys_in, .offset = 0, .range = size },
-            .{ .buffer = vals_in, .offset = 0, .range = size },
-            .{ .buffer = inds_in, .offset = 0, .range = size },
-            .{ .buffer = keys_out, .offset = 0, .range = vk.WHOLE_SIZE },
-            .{ .buffer = vals_out, .offset = 0, .range = vk.WHOLE_SIZE },
-            .{ .buffer = inds_out, .offset = 0, .range = vk.WHOLE_SIZE },
-            .{ .buffer = histograms, .offset = 0, .range = vk.WHOLE_SIZE },
-        };
 
-        var writes: [7]vk.WriteDescriptorSet = undefined;
-        for (0..7) |i| {
-            writes[i] = .{
-                .dst_set = self.descriptor_set,
-                .dst_binding = @intCast(i),
-                .dst_array_element = 0,
-                .descriptor_count = 1,
-                .descriptor_type = .storage_buffer,
-                .p_image_info = undefined,
-                .p_buffer_info = @ptrCast(&buffer_infos[i]),
-                .p_texel_buffer_view = undefined,
-            };
-        }
-
-        self.ctx.vkd.updateDescriptorSets(self.ctx.device, writes.len, &writes, 0, null);
-    }
     
     // Legacy Dispatch (Local Sort)
     pub fn dispatch(
@@ -339,15 +302,18 @@ pub const SortPipeline = struct {
             // num_elements is at offset 0.
             // But num_elements != num_workgroups.
             // We need to write num_workgroups at offset 0.
-            var pc_scan_bytes = std.mem.asBytes(&pc); // Copy
+            var pc_scan_data: [32]u8 = undefined;
+            const pc_slice = std.mem.asBytes(&pc);
+            @memcpy(pc_scan_data[0..pc_slice.len], pc_slice);
+            
             // Overwrite first u32
-            const wg_u32: u32 = workgroups;
-            @memcpy(pc_scan_bytes[0..4], std.mem.asBytes(&wg_u32));
+            const wg_u32: u32 = @intCast(workgroups); 
+            @memcpy(pc_scan_data[0..4], std.mem.asBytes(&wg_u32));
             
             self.ctx.vkd.cmdBindPipeline(self.command_buffer, .compute, self.scan_pipeline);
              // Bind sets (still needed effectively for histogram binding)
             self.ctx.vkd.cmdBindDescriptorSets(self.command_buffer, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
-            self.ctx.vkd.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .compute_bit = true }, 0, 32, pc_scan_bytes);
+            self.ctx.vkd.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PCs), &pc_scan_data);
             self.ctx.vkd.cmdDispatch(self.command_buffer, 1, 1, 1);
             
             // Barrier: Offsets ready for Scatter
