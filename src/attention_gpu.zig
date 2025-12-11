@@ -1,7 +1,9 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const VulkanContext = @import("vulkan_context.zig").VulkanContext;
-const BufferManager = @import("buffer_manager.zig").BufferManager;
+const buffer_manager_pkg = @import("buffer_manager.zig");
+const BufferManager = buffer_manager_pkg.BufferManager;
+const Buffer = buffer_manager_pkg.Buffer;
 const AttentionPipeline = @import("attention_pipeline.zig").AttentionPipeline;
 const BackwardPipelines = @import("attention_backward_pipeline.zig");
 const ForwardWithLsePipeline = BackwardPipelines.ForwardWithLsePipeline;
@@ -23,6 +25,10 @@ pub const AttentionEngine = struct {
     sort_pipeline: ?SortPipeline,
     gravity_pipeline: ?GravityPipeline,
     allocator: std.mem.Allocator,
+
+    // Persistent Sort Buffers (to avoid async use-after-free)
+    radix_hist_buffer: ?Buffer = null,
+    radix_inds_temp: ?Buffer = null,
 
     const Self = @This();
 
@@ -136,36 +142,44 @@ pub const AttentionEngine = struct {
         const WORKGROUP = 256;
         const num_workgroups = (num_elements + WORKGROUP - 1) / WORKGROUP;
 
-        // 1. Allocate Temp Buffers
+        // 1. Allocate/Reuse Persistent Buffers
         // Histograms: [NumGroups * 256] (u32)
         const hist_size = num_workgroups * 256 * 4;
-        var hist_buf = try self.buffer_manager.createBuffer(hist_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
-        defer self.buffer_manager.destroyBuffer(&hist_buf);
+        if (self.radix_hist_buffer == null or self.radix_hist_buffer.?.size < hist_size) {
+             if (self.radix_hist_buffer) |*b| self.buffer_manager.destroyBuffer(b);
+             self.radix_hist_buffer = try self.buffer_manager.createBuffer(hist_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
+        }
+        const hist_buf = self.radix_hist_buffer.?;
 
         // Indices Ping-Pong: We need a secondary indices buffer
         const inds_size = num_elements * 4;
-        var inds_temp = try self.buffer_manager.createBuffer(inds_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
-        defer self.buffer_manager.destroyBuffer(&inds_temp);
+        if (self.radix_inds_temp == null or self.radix_inds_temp.?.size < inds_size) {
+             if (self.radix_inds_temp) |*b| self.buffer_manager.destroyBuffer(b);
+             self.radix_inds_temp = try self.buffer_manager.createBuffer(inds_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
+        }
+        const inds_temp = self.radix_inds_temp.?;
 
-        // 2. Initialize Indices to 0..N
-        try sort_pipe.dispatchIota(indices.getBuffer(), num_elements);
-
+        // 2. Initialize Indices to 0..S-1 per segment
+        const S = keys.shape[2];
+        const num_segments = keys.shape[0] * keys.shape[1];
+        try sort_pipe.dispatchIota(indices.getBuffer(), num_elements, @intCast(S));
 
         // 3. Perform Radix Sort (4 passes)
-        // Setup Descriptor Sets for Ping-Pong
-        sort_pipe.updateDescriptorsRadix(
+        std.debug.print("DEBUG: dispatchRadix PRE-CALL. d_model={}, num_elements={}, S={}\n", .{d_model, num_elements, S});
+        if (d_model == 0) return error.InvalidDModel;
+
+        // Note: dispatchRadix handles descriptor updates internally now.
+        try sort_pipe.dispatchRadix(
             keys.getBuffer(),
             values.getBuffer(),
             indices.getBuffer(),
             inds_temp.buffer,
             hist_buf.buffer,
-            keys.byteSize(), // Size of keys/vals
-        );
-
-        try sort_pipe.dispatchRadix(
             num_elements,
             d_model,
             sort_dim,
+            @intCast(num_segments),
+            @intCast(S),
         );
     }
 
@@ -174,6 +188,8 @@ pub const AttentionEngine = struct {
         if (self.forward_lse_pipeline) |*fp| fp.deinit();
         if (self.sort_pipeline) |*sp| sp.deinit();
         if (self.gravity_pipeline) |*gp| gp.deinit();
+        if (self.radix_hist_buffer) |*b| self.buffer_manager.destroyBuffer(b);
+        if (self.radix_inds_temp) |*b| self.buffer_manager.destroyBuffer(b);
         self.pipeline.deinit();
         self.ctx.deinit();
         self.allocator.destroy(self.ctx);
@@ -447,15 +463,15 @@ pub const AttentionEngine = struct {
         output: *GpuTensor,
         rot_cos: ?*const GpuTensor,
         rot_sin: ?*const GpuTensor,
-        indices: *const GpuTensor,
+        indices: *GpuTensor,
         causal: bool,
         max_attend: u32,
     ) !void {
         const gravity_pipe = self.gravity_pipeline orelse return error.GravityPipelineNotInitialized;
+        const sort_pipe = self.sort_pipeline orelse return error.SortPipelineNotInitialized;
 
         // Validations
-        // Same as forward...
-         if (Q.ndim != 4 or K.ndim != 4 or V.ndim != 4 or output.ndim != 4) return error.InvalidShape;
+        if (Q.ndim != 4 or K.ndim != 4 or V.ndim != 4 or output.ndim != 4) return error.InvalidShape;
 
         const batch_size = Q.shape[0];
         const num_heads = Q.shape[1];
@@ -464,12 +480,6 @@ pub const AttentionEngine = struct {
         
         // GQA support
         if (K.shape[0] != batch_size or (num_heads % K.shape[1] != 0) or K.shape[3] != head_dim) return error.ShapeMismatch;
-        
-        // Indices validation
-        // Indices should match K's sequence count. 
-        // For broad compatibility, check byte size or element count if possible.
-        // indices.element_count should roughly match batch * num_kv_heads * key_seq_len ?
-        // Or if sorted globally, ensure total size matches.
         
         // RoPE
         var rope_size: u64 = 0;
@@ -487,7 +497,46 @@ pub const AttentionEngine = struct {
 
         const num_kv_heads = K.shape[1];
         const key_seq_len = K.shape[2];
-        
+
+        // --- SORTING PHASE ---
+        {
+             // 1. Allocate Temp Buffers for Sort
+             const num_elements = batch_size * num_kv_heads * key_seq_len;
+             const WORKGROUP = 256;
+             const num_workgroups = (num_elements + WORKGROUP - 1) / WORKGROUP;
+             
+             // Histograms: [NumGroups * 256] (u32)
+             const hist_size = num_workgroups * 256 * 4;
+             var hist_buf = try self.buffer_manager.createBuffer(hist_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
+             defer self.buffer_manager.destroyBuffer(&hist_buf);
+             
+             // Temp Indices for Ping-Pong
+             const inds_size = num_elements * 4;
+             var inds_temp = try self.buffer_manager.createBuffer(inds_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
+             defer self.buffer_manager.destroyBuffer(&inds_temp);
+             
+             // 2. Dispatch Iota (Initialize Indices)
+             const S = key_seq_len;
+             const num_segments = batch_size * num_kv_heads;
+             try sort_pipe.dispatchIota(indices.getBuffer(), num_elements, @intCast(S));
+             
+             // 3. Dispatch Radix Sort
+             // Use sort_dim = 0 for now (default)
+             try sort_pipe.dispatchRadix(
+                K.getBuffer(),
+                V.getBuffer(), // Passed but assumed unused for value movement
+                indices.getBuffer(), // Final
+                inds_temp.buffer,    // Temp
+                hist_buf.buffer,     // Hist
+                num_elements,
+                head_dim, // d_model
+                0,        // Sort Dim 0
+                @intCast(num_segments),
+                @intCast(S)
+             );
+        }
+        // --- END SORTING PHASE ---
+
         gravity_pipe.updateDescriptors(
              Q.getBuffer(),
              K.getBuffer(),

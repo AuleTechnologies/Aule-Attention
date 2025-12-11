@@ -11,99 +11,68 @@ layout(std430, set = 0, binding = 6) buffer Data {
     uint data[];
 };
 
+// Global shared totals for this segment
 shared uint bin_totals[256];
-
-// We run this with 1 Workgroup of 256 threads.
-// Each thread 'd' handles one digit (0..255).
-// It iterates through the workgroups.
 
 void main() {
     uint digit = gl_LocalInvocationID.x; // 0..255
+    uint segment_id = gl_WorkGroupID.x; // We dispatch 1 group per segment
     
-    // We need to compute prefix sums.
-    // The order is: 
-    // Digit 0: Block 0, Block 1, ... Block N
-    // Digit 1: Block 0, Block 1, ...
+    // Calculate global block range for this segment
+    // We pushed "blocks_per_segment" into the first slot of PushConstants?
+    // See sort_pipeline.zig: we overwrote the first u32.
+    // So `num_workgroups` in Scan shader acts as `blocks_per_segment`.
+    uint blocks_per_seg = num_workgroups;
     
-    // BUT, we also need the base offset for Digit D, which is Sum(TotalCount(d') for d'<D).
+    uint start_block = segment_id * blocks_per_seg;
+    uint end_block = start_block + blocks_per_seg;
     
-    // Step 1: Compute Total Count for this digit.
-    // Each thread sums column 'digit' across all blocks.
+    // Step 1: Compute Total Count for this digit within this segment
     uint total_count_for_digit = 0;
-    for (uint i = 0; i < num_workgroups; i++) {
+    
+    // Iterate only over blocks belonging to this segment
+    for (uint i = start_block; i < end_block; i++) {
         total_count_for_digit += data[i * 256 + digit];
     }
     
-    // Step 2: Prefix Sum of Totals across digits.
-    // We need to know where Digit 'd' starts globally.
-    // This requires a scan across the 256 threads.
-    // We can use Subgroup operations or shared mem.
-    
-    // Parallel Prefix Sum (Workgroup Scan)
-    // Using simple O(N) shared mem scan for simplicity as 256 is small.
-    // Or just simple subgroup if available (Vulkan 1.1+ usually has subgroups).
-    // Let's use naive shared memory scan for max compatibility.
-    
-    // Shared mem for 'DigitOffsets'
-    // digit_offsets[d] = Sum(total_count[0..d-1])
-    
-    // Actually, let's just do a naive serial scan in thread 0 and broadcast? 
-    // No, that's slow. 
-    // Hillis-Steele or similar.
-    
-    // Optimization: Just allow thread 0 to do it? 
-    // 256 additions is nothing.
-    
-    // Let's store total counts in "offsets" temporarily? No.
-    // We have to write the output offsets for EVERY block.
-    
-    // Structure of Output Offsets:
-    // offsets[wID * 256 + digit] should store the GLOBAL index where 
-    // key with 'digit' from 'wID' should be written.
-    
-    // Algorithm:
-    // 1. Each thread `d` calculates the local prefix sums for its column `d` across blocks.
-    //    Store these in `histograms` (if we could write) or a temp buffer. 
-    //    But we only have `offsets` out.
-    //    Let's write: `offsets[wID * 256 + d] = inclusive_prefix_sum(d, wID)`.
-    //    Where `inclusive_prefix_sum` is sum of `count` from block 0 to wID for digit `d`.
-    //    Also store `total_count_for_digit` (the last value).
-    
+    // Step 2: Local Prefix Sum (across blocks for this digit)
+    // We want output `data` to be EXCLUSIVE prefix sum relative to segment start.
     uint running_sum = 0;
-    for (uint i = 0; i < num_workgroups; i++) {
+    for (uint i = start_block; i < end_block; i++) {
         uint count = data[i * 256 + digit];
-        // We want EXCLUSIVE prefix sum relative to the start of the digit bucket?
-        // Let's store EXCLUSIVE sum of blocks.
         data[i * 256 + digit] = running_sum;
         running_sum += count;
     }
     uint total_for_digit = running_sum;
     
-    // Step 3: Now `data[i*256+d]` relies on Digit D starting at 0.
-    // We must add the `GlobalDigitBase` (Sum of all counts for digits < D).
-    
-    // We need to scan `total_for_digit` across threads 0..255.
-    // We can use a workgroup barrier and shared mem.
-    
-    // shared uint bin_totals[256]; // Moved to global
+    // Step 3: Global Prefix Sum (across digits)
+    // Scan `total_for_digit` across threads 0..255.
     bin_totals[digit] = total_for_digit;
     barrier();
     
-    // Thread 0 computes prefix sum of `bin_totals`
     if (digit == 0) {
         uint sum = 0;
         for (uint i = 0; i < 256; i++) {
             uint val = bin_totals[i];
-            bin_totals[i] = sum; // Replace with exclusive prefix sum
+            bin_totals[i] = sum;
             sum += val;
         }
+        // Write global offsets
+        // global_offsets[wID * 256 + lID] = global_histogram[lID]; // Wait, we need prefix sum of HISTOGRAMS
+        // current logic is incomplete scan? 
+        // Wait. "radix_scan.comp" logic in implementation plan...
+        
+        // For now, inject 77.
+        // if (digit == 0) {
+        //    data[0] = 77;
+        // }
     }
     barrier();
     
     uint global_base = bin_totals[digit];
     
-    // Step 4: Add global base to all block offsets
-    for (uint i = 0; i < num_workgroups; i++) {
+    // Step 4: Add "global base" (digit base) to all block offsets
+    for (uint i = start_block; i < end_block; i++) {
         data[i * 256 + digit] += global_base;
     }
 }

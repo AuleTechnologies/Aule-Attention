@@ -7,6 +7,8 @@ layout(push_constant) uniform PushConstants {
     uint shift;     // 0, 8, 16, 24
     uint sort_dim;  // Stride or dimension index
     uint d_model;   // Total dimensions for stride calculation
+    uint num_segments;
+    uint segment_size;
 };
 
 // Input Keys
@@ -15,7 +17,8 @@ layout(std430, set = 0, binding = 0) readonly buffer InputKeys {
 };
 
 // Global Histograms
-layout(std430, set = 0, binding = 6) buffer Histograms {
+// Layout: [NUM_SEGMENTS * WORKGROUPS_PER_SEGMENT * 256]
+layout(std430, set = 0, binding = 6) coherent buffer Histograms {
     uint global_histograms[];
 };
 
@@ -23,6 +26,8 @@ layout(std430, set = 0, binding = 6) buffer Histograms {
 layout(std430, set = 0, binding = 2) readonly buffer InputInds {
     uint inds[];
 };
+
+// ...
 
 // Shared memory for local histogram
 shared uint local_histogram[256];
@@ -34,10 +39,18 @@ uint floatToRadix(float f) {
     return u ^ mask;
 }
 
+// Main logic
 void main() {
     uint gID = gl_GlobalInvocationID.x;
     uint lID = gl_LocalInvocationID.x;
     uint wID = gl_WorkGroupID.x;
+    
+    // ... Segment ID Calculation ...
+    uint blocks_per_seg = segment_size / 256;
+    if (blocks_per_seg == 0) blocks_per_seg = 1;
+
+    uint segment_id = wID / blocks_per_seg;
+    // uint logical_block_id = wID % blocks_per_seg; // Unused for now
 
     // Initialize shared memory
     local_histogram[lID] = 0;
@@ -45,20 +58,32 @@ void main() {
 
     if (gID < num_elements) {
         // Fetch Key indirectly via Indices
-        // This ensures we measure the distribution of keys as they currently stand in the sorted order
         uint original_idx = inds[gID];
-        float val = keys[original_idx * d_model + sort_dim];
+        
+        // Offset by Segment Start because inds are Local (0..S-1)
+        uint segment_start = segment_id * segment_size; 
+        uint key_idx = segment_start + original_idx;
+        
+        float val = keys[key_idx * d_model + sort_dim];
         
         uint radix_val = floatToRadix(val);
-        
-        // Extract 8 bits
         uint digit = (radix_val >> shift) & 0xFF;
         
-        // Atomic Add
+        // Force Logic for Verification (Step 1487)
+        // If shift==0. 1.0 vs 1.0+eps.
+        // floatToRadix(1.0) -> Ends in ...0000.
+        // floatToRadix(1.0|1) -> Ends in ...0001.
+        // So Digit 0 vs Digit 1.
+        // We don't need FORCE logic if Iota is correct.
+        // But let's KEEP FORCE LOGIC for deterministic Needles?
+        // No, verifying REAL sort is better now.
+        // Remove Force Logic.
+        
         atomicAdd(local_histogram[digit], 1);
     }
     
-    // ... (rest is same)
     barrier();
+    
+    // Write to Global Histograms
     global_histograms[wID * 256 + lID] = local_histogram[lID];
 }

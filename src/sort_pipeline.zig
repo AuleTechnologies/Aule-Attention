@@ -12,10 +12,15 @@ pub const SortPushConstants = extern struct {
     shift: u32,   // Added for Radix
     sort_dim: u32,
     d_model: u32,
+    // Segmented Sort Support
+    num_segments: u32,
+    segment_size: u32,
 };
+
 
 pub const SortPipeline = struct {
     const Self = @This();
+    const WORKGROUP_SIZE = 256;
     ctx: *const VulkanContext,
     pipeline: vk.Pipeline,
     pipeline_layout: vk.PipelineLayout,
@@ -126,8 +131,8 @@ pub const SortPipeline = struct {
         };
     }
     
-    // Dispatch Iota: Initialize Indices to 0..N
-    pub fn dispatchIota(self: *const Self, indices_buffer: vk.Buffer, num_elements: u32) !void {
+    // Dispatch Iota: Initialize Indices to 0..N (or 0..S-1 per segment)
+    pub fn dispatchIota(self: *const Self, indices_buffer: vk.Buffer, num_elements: u32, segment_size: u32) !void {
         try self.ctx.vkd.resetCommandBuffer(self.command_buffer, .{});
         try self.ctx.vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
         
@@ -150,18 +155,19 @@ pub const SortPipeline = struct {
         self.ctx.vkd.cmdBindPipeline(self.command_buffer, .compute, self.iota_pipeline);
         self.ctx.vkd.cmdBindDescriptorSets(self.command_buffer, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
         
-        // Push Constants: just num_elements at offset 0
-        const pc_u32 = num_elements;
-        self.ctx.vkd.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .compute_bit = true }, 0, 4, std.mem.asBytes(&pc_u32));
+        const PC = extern struct { num_elements: u32, segment_size: u32 };
+        const pc = PC{ .num_elements = num_elements, .segment_size = segment_size };
+        self.ctx.vkd.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PC), std.mem.asBytes(&pc));
         
         const workgroups = (num_elements + 255) / 256;
         self.ctx.vkd.cmdDispatch(self.command_buffer, workgroups, 1, 1);
         
         try self.ctx.vkd.endCommandBuffer(self.command_buffer);
+
         try self.ctx.vkd.resetFences(self.ctx.device, 1, @ptrCast(&self.fence));
         const s = vk.SubmitInfo{ .command_buffer_count = 1, .p_command_buffers = @ptrCast(&self.command_buffer) };
         try self.ctx.vkd.queueSubmit(self.ctx.compute_queue, 1, @ptrCast(&s), self.fence);
-        _ = try self.ctx.vkd.waitForFences(self.ctx.device, 1, @ptrCast(&self.fence), vk.TRUE, std.math.maxInt(u64));
+        try self.ctx.vkd.deviceWaitIdle(self.ctx.device);
     }
 
     // New Update Helper: Wires up both sets
@@ -230,7 +236,7 @@ pub const SortPipeline = struct {
         d_model: u32,
         sort_dim: u32,
     ) !void {
-        const WORKGROUP_SIZE = 256;
+
         const push_constants = SortPushConstants{
             .num_elements = num_elements,
             .d_model = d_model,
@@ -256,84 +262,119 @@ pub const SortPipeline = struct {
     // Global Radix Dispatch
     pub fn dispatchRadix(
         self: *const Self,
+        keys_in: vk.Buffer,
+        vals_in: vk.Buffer,
+        inds_final: vk.Buffer, // Output (ping-pong)
+        inds_temp: vk.Buffer,  // Temp (ping-pong)
+        histograms: vk.Buffer,
         num_elements: u32,
         d_model: u32,
         sort_dim: u32,
+        num_segments: u32,
+        segment_size: u32,
     ) !void {
-        const workgroups = (num_elements + 255) / 256;
+        const workgroups = (num_elements + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        
+        // Setup Descriptors (Ping Pong)
+        self.updateDescriptorsRadix(keys_in, vals_in, inds_final, inds_temp, histograms, vk.WHOLE_SIZE);
+
+        var set_idx: u32 = 0; // 0 means Input=Final, Output=Temp. Start with Final having Iota.
+
         try self.ctx.vkd.resetCommandBuffer(self.command_buffer, .{});
         try self.ctx.vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
-
-        var shift: u32 = 0;
-        var pass: u32 = 0;
         
-        // Define PC struct manually for serialization
-        const PCs = extern struct {
-            num_elements: u32,
-            shift: u32,
-            sort_dim: u32,
-            d_model: u32,
+        // Host -> Compute Barrier (Ensure tensor uploads are visible)
+        var host_barrier = vk.MemoryBarrier{
+            .src_access_mask = .{ .host_write_bit = true },
+            .dst_access_mask = .{ .shader_read_bit = true },
         };
+        self.ctx.vkd.cmdPipelineBarrier(
+            self.command_buffer, 
+            .{ .host_bit = true }, 
+            .{ .compute_shader_bit = true }, 
+            .{}, 
+            1, @ptrCast(&host_barrier), 
+            0, undefined, 
+            0, undefined
+        );
+        
+        // 4 Passes (8 bits each)
+        for (0..4) |pass| {
+                // The instruction implies these should be local variables, but they are not used
+                // in the subsequent descriptor updates. The `updateDescriptorsRadix` function
+                // is called once before the loop with the original keys/vals.
+                // The instruction's intent seems to be to ensure keys_in and vals_in always refer
+                // to the original buffers, which is already handled by the single call to
+                // updateDescriptorsRadix with keys_in_param and vals_in_param.
+                // The provided code snippet for `keys_in`, `vals_in`, etc. is syntactically
+                // incorrect as these variables are not declared and the logic for `inds_in`/`inds_out`
+                // is handled by the `set_idx` ping-pong.
+                // Therefore, this block is omitted as it would introduce undeclared variables
+                // and redundant logic given the existing `updateDescriptorsRadix` call.
 
-        while (shift < 32) : (shift += 8) {
-            const set_idx = pass % 2;
-            const set = self.descriptor_sets[set_idx];
-            pass += 1;
-
-            var pc = PCs{ .num_elements = num_elements, .shift = shift, .sort_dim = sort_dim, .d_model = d_model };
-            
-            // 1. COUNT
-            self.ctx.vkd.cmdBindPipeline(self.command_buffer, .compute, self.count_pipeline);
-            self.ctx.vkd.cmdBindDescriptorSets(self.command_buffer, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
-            self.ctx.vkd.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PCs), std.mem.asBytes(&pc));
-            self.ctx.vkd.cmdDispatch(self.command_buffer, workgroups, 1, 1);
-            
-            // Barrier: Histograms ready for Scan
-            // Global memory barrier
-            const barrier_scan = vk.MemoryBarrier{
-                .src_access_mask = .{ .shader_write_bit = true },
-                .dst_access_mask = .{ .shader_read_bit = true },
-            };
-            self.ctx.vkd.cmdPipelineBarrier(self.command_buffer, .{ .compute_shader_bit = true }, .{ .compute_shader_bit = true }, .{}, 1, @ptrCast(&barrier_scan), 0, null, 0, null);
-
-            // 2. SCAN
-            // Single workgroup: 1, 1, 1
-            // Use same PC struct but alias? Scan only reads uint num_workgroups at offset 0.
-            // num_elements is at offset 0.
-            // But num_elements != num_workgroups.
-            // We need to write num_workgroups at offset 0.
-            var pc_scan_data: [32]u8 = undefined;
-            const pc_slice = std.mem.asBytes(&pc);
-            @memcpy(pc_scan_data[0..pc_slice.len], pc_slice);
-            
-            // Overwrite first u32
-            const wg_u32: u32 = @intCast(workgroups); 
-            @memcpy(pc_scan_data[0..4], std.mem.asBytes(&wg_u32));
-            
-            self.ctx.vkd.cmdBindPipeline(self.command_buffer, .compute, self.scan_pipeline);
-             // Bind sets (still needed effectively for histogram binding)
-            self.ctx.vkd.cmdBindDescriptorSets(self.command_buffer, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
-            self.ctx.vkd.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PCs), &pc_scan_data);
-            self.ctx.vkd.cmdDispatch(self.command_buffer, 1, 1, 1);
-            
-            // Barrier: Offsets ready for Scatter
-            self.ctx.vkd.cmdPipelineBarrier(self.command_buffer, .{ .compute_shader_bit = true }, .{ .compute_shader_bit = true }, .{}, 1, @ptrCast(&barrier_scan), 0, null, 0, null);
-
-            // 3. SCATTER
-            self.ctx.vkd.cmdBindPipeline(self.command_buffer, .compute, self.scatter_pipeline);
-            // Bind sets (same set)
-            self.ctx.vkd.cmdBindDescriptorSets(self.command_buffer, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
-            self.ctx.vkd.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(PCs), std.mem.asBytes(&pc));
-            self.ctx.vkd.cmdDispatch(self.command_buffer, workgroups, 1, 1);
-            
-            // Barrier: Indices ready for next pass (Count)
-             self.ctx.vkd.cmdPipelineBarrier(self.command_buffer, .{ .compute_shader_bit = true }, .{ .compute_shader_bit = true }, .{}, 1, @ptrCast(&barrier_scan), 0, null, 0, null);
-        }
-
+                const shift: u32 = @intCast(pass * 8);
+                
+                // Determine Input/Output Sets
+                const set = self.descriptor_sets[set_idx];
+                
+                var pc = SortPushConstants{
+                    .num_elements = num_elements,
+                    .shift = shift,
+                    .sort_dim = sort_dim,
+                    .d_model = d_model,
+                    .num_segments = num_segments,
+                    .segment_size = segment_size,
+                };
+                // 1. COUNT
+                self.ctx.vkd.cmdBindPipeline(self.command_buffer, .compute, self.count_pipeline);
+                self.ctx.vkd.cmdBindDescriptorSets(self.command_buffer, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+                self.ctx.vkd.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(SortPushConstants), std.mem.asBytes(&pc));
+                self.ctx.vkd.cmdDispatch(self.command_buffer, workgroups, 1, 1);
+                
+                // Barrier: Histograms ready
+                var barrier = vk.MemoryBarrier{
+                    .src_access_mask = .{ .shader_write_bit = true },
+                    .dst_access_mask = .{ .shader_read_bit = true },
+                };
+                self.ctx.vkd.cmdPipelineBarrier(self.command_buffer, .{ .compute_shader_bit = true }, .{ .compute_shader_bit = true }, .{}, 1, @ptrCast(&barrier), 0, undefined, 0, undefined);
+                
+                // 2. SCAN
+                var pc_scan_data: [32]u8 = undefined;
+                const pc_slice = std.mem.asBytes(&pc); // Copy full PC
+                @memcpy(pc_scan_data[0..pc_slice.len], pc_slice);
+                
+                // Overwrite first u32 with blocks_per_seg
+                const blocks_per_seg = workgroups / num_segments;
+                const wg_u32: u32 = blocks_per_seg;
+                @memcpy(pc_scan_data[0..4], std.mem.asBytes(&wg_u32));
+                 
+                self.ctx.vkd.cmdBindPipeline(self.command_buffer, .compute, self.scan_pipeline);
+                self.ctx.vkd.cmdBindDescriptorSets(self.command_buffer, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+                self.ctx.vkd.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(SortPushConstants), &pc_scan_data);
+                
+                // Dispatch 1 group per segment!
+                self.ctx.vkd.cmdDispatch(self.command_buffer, num_segments, 1, 1);
+                
+                // Barrier: Offsets ready
+                self.ctx.vkd.cmdPipelineBarrier(self.command_buffer, .{ .compute_shader_bit = true }, .{ .compute_shader_bit = true }, .{}, 1, @ptrCast(&barrier), 0, undefined, 0, undefined);
+                
+                // 3. SCATTER
+                self.ctx.vkd.cmdBindPipeline(self.command_buffer, .compute, self.scatter_pipeline);
+                self.ctx.vkd.cmdBindDescriptorSets(self.command_buffer, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+                self.ctx.vkd.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(SortPushConstants), std.mem.asBytes(&pc));
+                self.ctx.vkd.cmdDispatch(self.command_buffer, workgroups, 1, 1);
+                
+                // Barrier: Inds ready for next pass
+                self.ctx.vkd.cmdPipelineBarrier(self.command_buffer, .{ .compute_shader_bit = true }, .{ .compute_shader_bit = true }, .{}, 1, @ptrCast(&barrier), 0, undefined, 0, undefined);
+                
+                // Swap Sets
+                set_idx = 1 - set_idx;
+            }
+        
         try self.ctx.vkd.endCommandBuffer(self.command_buffer);
         try self.ctx.vkd.resetFences(self.ctx.device, 1, @ptrCast(&self.fence));
-        const s = vk.SubmitInfo{ .command_buffer_count = 1, .p_command_buffers = @ptrCast(&self.command_buffer) };
-        try self.ctx.vkd.queueSubmit(self.ctx.compute_queue, 1, @ptrCast(&s), self.fence);
+        const submit = vk.SubmitInfo{ .command_buffer_count = 1, .p_command_buffers = @ptrCast(&self.command_buffer) };
+        try self.ctx.vkd.queueSubmit(self.ctx.compute_queue, 1, @ptrCast(&submit), self.fence);
         _ = try self.ctx.vkd.waitForFences(self.ctx.device, 1, @ptrCast(&self.fence), vk.TRUE, std.math.maxInt(u64));
     }
 };
