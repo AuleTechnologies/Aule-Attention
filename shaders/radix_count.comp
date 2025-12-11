@@ -1,0 +1,64 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_elements;
+    uint shift;     // 0, 8, 16, 24
+    uint sort_dim;  // Stride or dimension index
+    uint d_model;   // Total dimensions for stride calculation
+};
+
+// Input Keys
+layout(std430, set = 0, binding = 0) readonly buffer InputKeys {
+    float keys[];
+};
+
+// Global Histograms
+layout(std430, set = 0, binding = 6) buffer Histograms {
+    uint global_histograms[];
+};
+
+// Input Indices (for stable sort passes)
+layout(std430, set = 0, binding = 2) readonly buffer InputInds {
+    uint inds[];
+};
+
+// Shared memory for local histogram
+shared uint local_histogram[256];
+
+// Float to Radix Uint conversion (approximates ordering)
+uint floatToRadix(float f) {
+    uint u = floatBitsToUint(f);
+    uint mask = -int(u >> 31) | 0x80000000;
+    return u ^ mask;
+}
+
+void main() {
+    uint gID = gl_GlobalInvocationID.x;
+    uint lID = gl_LocalInvocationID.x;
+    uint wID = gl_WorkGroupID.x;
+
+    // Initialize shared memory
+    local_histogram[lID] = 0;
+    barrier();
+
+    if (gID < num_elements) {
+        // Fetch Key indirectly via Indices
+        // This ensures we measure the distribution of keys as they currently stand in the sorted order
+        uint original_idx = inds[gID];
+        float val = keys[original_idx * d_model + sort_dim];
+        
+        uint radix_val = floatToRadix(val);
+        
+        // Extract 8 bits
+        uint digit = (radix_val >> shift) & 0xFF;
+        
+        // Atomic Add
+        atomicAdd(local_histogram[digit], 1);
+    }
+    
+    // ... (rest is same)
+    barrier();
+    global_histograms[wID * 256 + lID] = local_histogram[lID];
+}

@@ -29,6 +29,12 @@ const attention_f32_spv = @embedFile("attention_f32_spv");
 const attention_amd_spv = @embedFile("attention_amd_spv");
 const attention_fwd_lse_spv = @embedFile("attention_fwd_lse_spv");
 const attention_bwd_spv = @embedFile("attention_bwd_spv");
+const spatial_sort_spv = @embedFile("spatial_sort_spv"); // Legacy local sort
+const attention_gravity_spv = @embedFile("attention_gravity_spv");
+const radix_count_spv = @embedFile("radix_count_spv");
+const radix_scan_spv = @embedFile("radix_scan_spv");
+const radix_scatter_spv = @embedFile("radix_scatter_spv");
+const iota_spv = @embedFile("iota_spv");
 
 // ============================================================================
 // C API
@@ -36,8 +42,10 @@ const attention_bwd_spv = @embedFile("attention_bwd_spv");
 
 export fn aule_init() callconv(.C) i32 {
     if (global_ctx != null) {
+        std.debug.print("aule_init: already initialized\n", .{});
         return 0; // Already initialized
     }
+    std.debug.print("aule_init: initializing...\n", .{});
 
     global_ctx = AttentionContext.initWithBackward(
         global_allocator,
@@ -45,6 +53,12 @@ export fn aule_init() callconv(.C) i32 {
         attention_amd_spv,
         attention_fwd_lse_spv,
         attention_bwd_spv,
+        spatial_sort_spv,
+        attention_gravity_spv,
+        radix_count_spv,
+        radix_scan_spv,
+        radix_scatter_spv,
+        iota_spv,
     ) catch |err| {
         setError("Failed to initialize backend: {}", .{err});
         log.err("Backend init failed: {}", .{err});
@@ -52,6 +66,7 @@ export fn aule_init() callconv(.C) i32 {
     };
 
     log.info("aule initialized successfully using {s} backend", .{global_ctx.?.getBackendName()});
+    std.debug.print("aule_init: complete\n", .{});
     return 0;
 }
 
@@ -269,6 +284,7 @@ export fn aule_tensor_create(
     seq_len: u32,
     head_dim: u32,
 ) callconv(.C) TensorHandle {
+    // std.debug.print("aule_tensor_create: called\n", .{});
     var ctx = global_ctx orelse { setError("Not initialized", .{}); return 0; };
     const slot_idx = allocTensorSlot() orelse { setError("Max tensors reached", .{}); return 0; };
 
@@ -283,6 +299,18 @@ export fn aule_tensor_create(
     tensor_storage[slot_idx] = ptr;
 
     return @as(TensorHandle, slot_idx + 1);
+}
+
+export fn aule_tensor_create_u32(
+    batch_size: u32,
+    num_heads: u32,
+    seq_len: u32,
+    head_dim: u32,
+) callconv(.C) TensorHandle {
+    // For now, backend only supports f32 tensors explicitly, 
+    // but GpuTensor doesn't distinguish sizes for 32-bit types.
+    // We treat it as f32 for storage but expose as u32 for API.
+    return aule_tensor_create(batch_size, num_heads, seq_len, head_dim);
 }
 
 export fn aule_tensor_destroy(handle: TensorHandle) callconv(.C) void {
@@ -322,6 +350,21 @@ export fn aule_tensor_download(handle: TensorHandle, output: [*]f32, count: u32)
     return 0;
 }
 
+export fn aule_tensor_download_u32(handle: TensorHandle, output: [*]u32, count: u32) callconv(.C) i32 {
+    var ctx = global_ctx orelse return -1;
+    if (handle == 0 or handle > MAX_TENSORS) return -1;
+    const tensor = tensor_storage[@intCast(handle - 1)] orelse return -1;
+
+    // Cast u32 buffer to f32 buffer for backend call (both are 32-bit)
+    const out_f32 = @as([*]f32, @ptrCast(output));
+    
+    ctx.download(tensor, out_f32[0..count]) catch |err| {
+        setError("Download u32 failed: {}", .{err});
+        return -3;
+    };
+    return 0;
+}
+
 export fn aule_attention_forward_gpu(
     q_handle: TensorHandle,
     k_handle: TensorHandle,
@@ -351,6 +394,63 @@ export fn aule_attention_forward_gpu(
 
     ctx.attention(q, k, v, o, rot_cos, rot_sin, causal != 0) catch |err| {
         setError("Attention failed: {}", .{err});
+        return -3;
+    };
+    return 0;
+}
+
+export fn aule_spatial_sort(
+    keys_handle: TensorHandle,
+    values_handle: TensorHandle,
+    indices_handle: TensorHandle,
+    sort_dim: u32,
+) callconv(.C) i32 {
+    var ctx = global_ctx orelse return -1;
+    
+    const keys = tensor_storage[@intCast(keys_handle - 1)] orelse return -1;
+    const values = tensor_storage[@intCast(values_handle - 1)] orelse return -1;
+    const indices = tensor_storage[@intCast(indices_handle - 1)] orelse return -1;
+
+    ctx.spatialSort(keys, values, indices, sort_dim) catch |err| {
+        setError("Spatial sort failed: {}", .{err});
+        return -3;
+    };
+    return 0;
+}
+
+export fn aule_attention_forward_gravity(
+    q_handle: TensorHandle,
+    k_handle: TensorHandle,
+    v_handle: TensorHandle,
+    output_handle: TensorHandle,
+    rot_cos_handle: TensorHandle,
+    rot_sin_handle: TensorHandle,
+    indices_handle: TensorHandle,
+    causal: i32,
+    max_attend: u32,
+) callconv(.C) i32 {
+    var ctx = global_ctx orelse return -1;
+    
+    const q = tensor_storage[@intCast(q_handle - 1)] orelse return -1;
+    const k = tensor_storage[@intCast(k_handle - 1)] orelse return -1;
+    const v = tensor_storage[@intCast(v_handle - 1)] orelse return -1;
+    const o = tensor_storage[@intCast(output_handle - 1)] orelse return -1;
+    const indices = tensor_storage[@intCast(indices_handle - 1)] orelse return -1;
+    
+    // Optional handles (0 means null)
+    var rot_cos: ?*Tensor = null;
+    if (rot_cos_handle != 0) {
+        rot_cos = tensor_storage[@intCast(rot_cos_handle - 1)];
+    }
+    
+    var rot_sin: ?*Tensor = null;
+    if (rot_sin_handle != 0) {
+        rot_sin = tensor_storage[@intCast(rot_sin_handle - 1)];
+    }
+
+    ctx.forwardGravity(q, k, v, o, rot_cos, rot_sin, indices, causal != 0, max_attend) catch |err| {
+        setError("Gravity Attention failed: {}", .{err});
+        log.err("Gravity Attention failed: {}", .{err});
         return -3;
     };
     return 0;

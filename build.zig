@@ -66,6 +66,44 @@ pub fn build(b: *std.Build) void {
     const attention_fwd_lse_spv = attention_fwd_lse_compile.addOutputFileArg("attention_forward_f32.spv");
     attention_fwd_lse_compile.addFileArg(b.path("shaders/attention_forward_f32.comp"));
 
+    // Spatial Sort shader
+    const spatial_sort_compile = b.addSystemCommand(&.{
+        "glslc",
+        "-O",
+        "--target-env=vulkan1.2",
+        "-o",
+    });
+    const spatial_sort_spv = spatial_sort_compile.addOutputFileArg("spatial_sort.spv");
+    spatial_sort_compile.addFileArg(b.path("shaders/spatial_sort.comp"));
+
+    // Gravity Attention shader
+    const attention_gravity_compile = b.addSystemCommand(&.{
+        "glslc",
+        "-O",
+        "--target-env=vulkan1.2",
+        "-o",
+    });
+    const attention_gravity_spv = attention_gravity_compile.addOutputFileArg("attention_gravity.spv");
+    attention_gravity_compile.addFileArg(b.path("shaders/attention_gravity.comp"));
+
+    // --- Radix Sort Shaders ---
+    const radix_count_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
+    const radix_count_spv = radix_count_compile.addOutputFileArg("radix_count.spv");
+    radix_count_compile.addFileArg(b.path("shaders/radix_count.comp"));
+
+    const radix_scan_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
+    const radix_scan_spv = radix_scan_compile.addOutputFileArg("radix_scan.spv");
+    radix_scan_compile.addFileArg(b.path("shaders/radix_scan.comp"));
+
+    const radix_scatter_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
+    const radix_scatter_spv = radix_scatter_compile.addOutputFileArg("radix_scatter.spv");
+    radix_scatter_compile.addFileArg(b.path("shaders/radix_scatter.comp"));
+
+    const iota_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
+    const iota_spv = iota_compile.addOutputFileArg("iota.spv");
+    iota_compile.addFileArg(b.path("shaders/iota.comp"));
+    // --------------------------
+
     // Main library (shared)
     const lib = b.addSharedLibrary(.{
         .name = "aule",
@@ -75,18 +113,19 @@ pub fn build(b: *std.Build) void {
     });
     lib.root_module.addImport("vulkan", vulkan_mod);
     lib.root_module.addOptions("config", options);
-    lib.root_module.addAnonymousImport("attention_f32_spv", .{
-        .root_source_file = attention_f32_spv,
-    });
-    lib.root_module.addAnonymousImport("attention_amd_spv", .{
-        .root_source_file = attention_amd_spv,
-    });
-    lib.root_module.addAnonymousImport("attention_bwd_spv", .{
-        .root_source_file = attention_bwd_spv,
-    });
-    lib.root_module.addAnonymousImport("attention_fwd_lse_spv", .{
-        .root_source_file = attention_fwd_lse_spv,
-    });
+    lib.root_module.addAnonymousImport("attention_f32_spv", .{ .root_source_file = attention_f32_spv });
+    lib.root_module.addAnonymousImport("attention_amd_spv", .{ .root_source_file = attention_amd_spv });
+    lib.root_module.addAnonymousImport("attention_bwd_spv", .{ .root_source_file = attention_bwd_spv });
+    lib.root_module.addAnonymousImport("attention_fwd_lse_spv", .{ .root_source_file = attention_fwd_lse_spv });
+    lib.root_module.addAnonymousImport("spatial_sort_spv", .{ .root_source_file = spatial_sort_spv });
+    lib.root_module.addAnonymousImport("attention_gravity_spv", .{ .root_source_file = attention_gravity_spv });
+    
+    // Radix Imports
+    lib.root_module.addAnonymousImport("radix_count_spv", .{ .root_source_file = radix_count_spv });
+    lib.root_module.addAnonymousImport("radix_scan_spv", .{ .root_source_file = radix_scan_spv });
+    lib.root_module.addAnonymousImport("radix_scatter_spv", .{ .root_source_file = radix_scatter_spv });
+    lib.root_module.addAnonymousImport("iota_spv", .{ .root_source_file = iota_spv });
+
     // Link Vulkan on native builds only - cross-compilation uses runtime dynamic loading
     const is_native = target.query.isNative();
     if (is_native) {
@@ -105,18 +144,18 @@ pub fn build(b: *std.Build) void {
     });
     static_lib.root_module.addImport("vulkan", vulkan_mod);
     static_lib.root_module.addOptions("config", options);
-    static_lib.root_module.addAnonymousImport("attention_f32_spv", .{
-        .root_source_file = attention_f32_spv,
-    });
-    static_lib.root_module.addAnonymousImport("attention_amd_spv", .{
-        .root_source_file = attention_amd_spv,
-    });
-    static_lib.root_module.addAnonymousImport("attention_bwd_spv", .{
-        .root_source_file = attention_bwd_spv,
-    });
-    static_lib.root_module.addAnonymousImport("attention_fwd_lse_spv", .{
-        .root_source_file = attention_fwd_lse_spv,
-    });
+    static_lib.root_module.addAnonymousImport("attention_f32_spv", .{ .root_source_file = attention_f32_spv });
+    static_lib.root_module.addAnonymousImport("attention_amd_spv", .{ .root_source_file = attention_amd_spv });
+    static_lib.root_module.addAnonymousImport("attention_bwd_spv", .{ .root_source_file = attention_bwd_spv });
+    static_lib.root_module.addAnonymousImport("attention_fwd_lse_spv", .{ .root_source_file = attention_fwd_lse_spv });
+    static_lib.root_module.addAnonymousImport("spatial_sort_spv", .{ .root_source_file = spatial_sort_spv });
+    static_lib.root_module.addAnonymousImport("attention_gravity_spv", .{ .root_source_file = attention_gravity_spv });
+    
+    // Radix Imports
+    static_lib.root_module.addAnonymousImport("radix_count_spv", .{ .root_source_file = radix_count_spv });
+    static_lib.root_module.addAnonymousImport("radix_scan_spv", .{ .root_source_file = radix_scan_spv });
+    static_lib.root_module.addAnonymousImport("radix_scatter_spv", .{ .root_source_file = radix_scatter_spv });
+    static_lib.root_module.addAnonymousImport("iota_spv", .{ .root_source_file = iota_spv });
     static_lib.linkSystemLibrary("vulkan");
     static_lib.linkLibC();
 

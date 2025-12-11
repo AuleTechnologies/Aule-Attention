@@ -1,0 +1,197 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint num_elements;
+    uint shift;     // 0, 8, 16, 24
+    uint sort_dim;
+    uint d_model;
+};
+
+// Input State
+layout(std430, set = 0, binding = 0) readonly buffer InputKeys { float keys_in[]; };
+layout(std430, set = 0, binding = 1) readonly buffer InputVals { float vals_in[]; };
+layout(std430, set = 0, binding = 2) readonly buffer InputInds { uint inds_in[]; }; // Original indices
+
+// Outputs (Ping-Pong Targets)
+layout(std430, set = 0, binding = 3) writeonly buffer OutKeys { float keys_out[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer OutVals { float vals_out[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer OutInds { uint inds_out[]; };
+
+// Offsets [NumWorkgroups * 256] from Scan Step
+layout(std430, set = 0, binding = 6) readonly buffer GlobalOffsets {
+    uint global_offsets[];
+};
+
+shared uint local_histogram[256];
+shared uint local_offsets[256]; // base offset for digit d in this block
+
+uint floatToRadix(float f) {
+    uint u = floatBitsToUint(f);
+    uint mask = -int(u >> 31) | 0x80000000;
+    return u ^ mask;
+}
+
+void main() {
+    uint gID = gl_GlobalInvocationID.x;
+    uint lID = gl_LocalInvocationID.x;
+    uint wID = gl_WorkGroupID.x;
+
+    // 1. Read key
+    uint radius_val = 0;
+    uint digit = 0;
+    float key_val = 0.0;
+    
+    // If within bounds
+    bool active_thread = gID < num_elements;
+    
+    if (active_thread) {
+        // Fetch input key
+        // NOTE: We move WHOLE vectors? Or just the key column?
+        // Sorting usually moves the key and the payload.
+        // here 'key' is the entire D-dim vector. 'val' is the entire D-dim vector.
+        // 'ind' is original index.
+        // Copying D * floats per thread is expensive if D is large.
+        // But for Needle test D=64.
+        // Wait, standard `argsort` usually only moves Indices and sorting Keys.
+        // Then we gather later?
+        // Gravity Attention takes Indices and gathers K/V on the fly.
+        // SO WE ONLY NEED TO SORT INDICES!
+        // Wait, `radix_sort` needs the sorting key for the NEXT pass.
+        // If we only move indices, we have to gather the keys next pass, which is slow (scatter-gather).
+        // Better to ping-pong the Sorting Key (scalar) and the Index.
+        // Do we need to move the full Key vector?
+        // Gravity Attention reads K/V from `Indices`. 
+        // So `Indices` must point to the *original* K/V buffer.
+        // So we do NOT need to move K/V.
+        // We only ping-pong `Indices`.
+        // AND we ping-pong the `SortingKeys` (scalar) to avoid gathering them again?
+        
+        // Actually, let's look at `spatial_sort.comp`. It outputs `Indices`.
+        // Gravity Attention uses `Indices` to read `OriginalKeys[Indices[i]]`.
+        // So we only need to produce a sorted list of Indices.
+        
+        // BUT, Radix Sort is iterative. Pass 2 needs keys sorted by Pass 1.
+        // If we don't permute the keys, Pass 2 reads unsorted keys?
+        // No, Pass 2 can read `Keys[Indices[i]]`. This is a Gather.
+        // Gather is acceptable?
+        // Optimization: Create a temporary "Sorting Keys" buffer (Scalar) that we ping-pong?
+        // That's much faster than gathering from large vectors.
+        
+        // Revised Plan (on the fly):
+        // 1. Extract `SortingKey` (scalar) from Input Key Matrix ONCE into a temp buffer.
+        // 2. Radix Sort the (ScalarKey, OriginalIndex) pairs.
+        // 3. Output `Indices`.
+        
+        // Does this change the shader?
+        // This shader assumes `keys_in` is the full matrix.
+        // If we assume `keys_in` acts as the source, we can just Gather.
+        // `float val = keys_in[inds_in[gID] * d_model + sort_dim];`
+        // Wait, `inds_in`?
+        // Pass 0: inds_in = 0..N.
+        // Pass 1: inds_in = permuted.
+        
+        // Let's stick to the Scatter logic:
+        // We read `inds_in[gID]`.
+        // We read the actual sorting key value for that index. `Keys[inds_in[gID]...]`
+        // digit = ...
+        // We perform the sort.
+        // We write to `inds_out[target_pos] = inds_in[gID]`.
+        
+        // This avoids moving the heavy K/V vectors.
+        // BUT, accessing `Keys[inds_in[gID]]` is random access (bad for cache).
+        // However, `Keys` is read-only.
+        // Is it better to make a "Scalar Key Buffer"?
+        // Yes. `src/sort_pipeline.zig` should create a `ScalarKeys` buffer.
+        
+        // Let's implement the shader assuming `InputKeys` is just the scalar keys being ping-ponged? 
+        // No, `sort_pipeline` signature takes full K/V.
+        // Let's assume the Shader does:
+        // `float key_val = keys_in[inds_in[gID] * d_model + sort_dim];`
+        
+        key_val = keys_in[inds_in[gID] * d_model + sort_dim];
+        radius_val = floatToRadix(key_val);
+        digit = (radius_val >> shift) & 0xFF;
+    }
+    
+    // 2. Local Count (for this thread's digit)
+    // We need to determine "Which occurence of 'digit' am I within this block?"
+    // We can use `subgroupAdd(1)` if available, or just Atomic.
+    // Atomics in shared mem are fast enough for 256.
+    
+    // Wait, we need to know the WRITE INDEX.
+    // Index = GlobalOffset[block, digit] + LocalRank.
+    // LocalRank = Count of 'digit' before me in this block.
+    
+    // To implement LocalRank without subgroups:
+    // It's equivalent to a Local Scan.
+    // That's tricky in one pass without subgroups.
+    // Option A: Re-count.
+    // Option B: 2-bit radix (4 passes per byte)? No.
+    
+    // Standard approach:
+    // 1. Count digits in shared mem (we already did this in pass 1, but we don't have it here).
+    // so we re-count.
+    // `local_histogram` initialized to 0.
+    // Barrier.
+    // `atomicAdd(local_histogram[digit], 1)`.
+    // Barrier.
+    // Scan `local_histogram` to get `local_offsets` (exclusive sum).
+    // These `local_offsets` tell us where the 'digit bucket' starts within the block.
+    // BUT they don't give us the 'rank' of the thread.
+    
+    // We need the RANK.
+    // `rank = atomicAdd(local_sub_counters[digit], 1)`.
+    // This gives unique index 0..k for that digit.
+    
+    // So:
+    // Shared `local_counters[256]` = 0.
+    // Barrier.
+    // `my_rank = atomicAdd(local_counters[digit], 1)`.
+    // Barrier.
+    // Now we need the start of the bucket.
+    // `local_start =` Scan of `local_counters`. (Prefix sum).
+    // Thread 0 does the scan of 256 items.
+    // Barrier.
+    
+    // `my_local_offset = local_offsets[digit] + my_rank`.
+    // `my_global_offset = global_offsets[wID * 256 + digit] + my_local_offset`.
+    
+    uint my_rank = 0;
+    if (active_thread) {
+        // Safe to use atomic on shared mem
+        my_rank = atomicAdd(local_histogram[digit], 1);
+    }
+    barrier();
+    
+    // Thread 0 Scans local_histogram into local_offsets
+    if (lID == 0) {
+        uint sum = 0;
+        for (uint i=0; i<256; i++) {
+            local_offsets[i] = sum;
+            sum += local_histogram[i];
+            // Reset histogram for safety if needed (not needed)
+        }
+    }
+    barrier();
+    
+    // 3. Scatter
+    if (active_thread) {
+        uint local_prefix = local_offsets[digit];
+        uint global_prefix = global_offsets[wID * 256 + digit];
+        
+        uint write_idx = global_prefix + local_prefix + my_rank;
+        
+        // Write Output
+        // We only move INDICES.
+        inds_out[write_idx] = inds_in[gID];
+        
+        // Do we move Keys/Vals?
+        // If we don't move them, the next pass implies we read `Keys[inds_out[...]]`.
+        // Which implies `inds_in` is the map.
+        // Yes, `inds_in` handles the permutation of the previous pass.
+        // So we never move Keys/Vals.
+        // We just keep permuting `inds`.
+    }
+}

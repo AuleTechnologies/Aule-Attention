@@ -34,6 +34,7 @@ pub const GpuTensor = struct {
         shape: []const u32,
         dtype: DType,
     ) !Self {
+        std.debug.print("GpuTensor.init: shape len {}\n", .{shape.len});
         if (shape.len > 4 or shape.len == 0) {
             return error.InvalidShape;
         }

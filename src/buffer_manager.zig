@@ -42,6 +42,7 @@ pub const BufferManager = struct {
         usage: vk.BufferUsageFlags,
         memory_flags: vk.MemoryPropertyFlags,
     ) !Buffer {
+        std.debug.print("BufferManager.createBuffer: size {}\n", .{size});
         const buffer = try self.ctx.vkd.createBuffer(self.ctx.device, &.{
             .size = size,
             .usage = usage,

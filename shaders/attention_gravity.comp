@@ -1,0 +1,165 @@
+#version 450
+
+// Gravity Attention - fp32
+// Indirect attention utilizing spatially sorted indices for future optimization.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// 0: Q, 1: K, 2: V, 3: O, 4: Cos, 5: Sin
+layout(std430, set = 0, binding = 0) readonly buffer QBuffer { float data[]; } Q;
+layout(std430, set = 0, binding = 1) readonly buffer KBuffer { float data[]; } K;
+layout(std430, set = 0, binding = 2) readonly buffer VBuffer { float data[]; } V;
+layout(std430, set = 0, binding = 3) writeonly buffer OutputBuffer { float data[]; } O;
+layout(std430, set = 0, binding = 4) readonly buffer RotaryCosBuffer { float data[]; } RotCos;
+layout(std430, set = 0, binding = 5) readonly buffer RotarySinBuffer { float data[]; } RotSin;
+
+// 6: Indices (New!)
+layout(std430, set = 0, binding = 6) readonly buffer IndexBuffer { uint data[]; } Indices;
+
+layout(push_constant) uniform PushConstants {
+    uint batch_size;    // B
+    uint num_heads;     // H
+    uint seq_len;       // N
+    uint head_dim;      // D
+    float scale;
+    uint causal;
+    uint has_rope;
+    uint num_kv_heads;
+    uint key_seq_len;
+    uint max_attend;    // Top-K limit
+} params;
+
+const uint BLOCK_SIZE = 16;
+
+shared float s_Q[BLOCK_SIZE][64];
+// We load K/V indirectly, but cache them sequentially in shared memory
+shared float s_K[BLOCK_SIZE][64];
+shared float s_V[BLOCK_SIZE][64];
+shared float s_S[BLOCK_SIZE][BLOCK_SIZE];
+
+// We also need to cache the *original indices* for the chunk to handle causal masking correctly
+shared uint s_Idx[BLOCK_SIZE];
+
+void main() {
+    uint local_row = gl_LocalInvocationID.y;
+    uint local_col = gl_LocalInvocationID.x;
+
+    uint batch_head_idx = gl_WorkGroupID.z;
+    uint batch_idx = batch_head_idx / params.num_heads;
+    uint head_idx = batch_head_idx % params.num_heads;
+    
+    // GQA
+    uint ratio = params.num_heads / params.num_kv_heads;
+    uint kv_head_idx = head_idx / ratio;
+    uint kv_batch_head_idx = batch_idx * params.num_kv_heads + kv_head_idx;
+    
+    uint qs_off = batch_head_idx * params.seq_len * params.head_dim;
+    // Base offset for K/V - we will add indirect offset to this
+    uint ks_base = kv_batch_head_idx * params.key_seq_len * params.head_dim;
+    
+    // Indices are typically [Batch*Head*Seq] or just [Seq].
+    // Note: The current spatial_sort is global-ish or per tensor.
+    // If we assume the Indices buffer matches K's layout (Batch*KVHead*Seq),
+    // then we access Indices at kv_batch_head_idx * key_seq_len.
+    uint indices_base = kv_batch_head_idx * params.key_seq_len;
+
+    uint block_row = gl_WorkGroupID.y;
+    uint global_row = block_row * BLOCK_SIZE + local_row;
+    bool is_active = (batch_idx < params.batch_size) && (global_row < params.seq_len);
+
+    uint output_off = qs_off + global_row * params.head_dim;
+
+    // Accumulators
+    uint actual_head_dim = min(params.head_dim, 64u);
+    // Load Q vector for this thread (row)
+    float q_vec[64];
+    float output_vec[64];
+    for (uint i=0; i<actual_head_dim; i++) output_vec[i] = 0.0;
+    
+    // Global Q pointer
+    uint q_ptr = qs_off + global_row * params.head_dim;
+    // Load Q into registers
+    if (is_active) {
+        for (uint d=0; d<actual_head_dim; d++) {
+            float val = Q.data[q_ptr + d];
+            // RoPE Q
+            if (params.has_rope != 0u) {
+                uint rot_idx = global_row * (params.head_dim / 2) + (d / 2);
+                float c = RotCos.data[rot_idx];
+                float s = RotSin.data[rot_idx];
+                if ((d % 2) == 0) {
+                    float pair = Q.data[q_ptr + d + 1];
+                    val = val * c - pair * s;
+                } else {
+                    float pair = Q.data[q_ptr + d - 1];
+                    val = pair * s + val * c;
+                }
+            }
+            q_vec[d] = val;
+        }
+    }
+
+    float row_max = -1e30;
+    float row_sum = 0.0;
+
+    // Iterate sorted keys up to max_attend or sequence length
+    uint limit = min(params.key_seq_len, params.max_attend);
+    for (uint j=0; j<limit; j++) {
+        // Load Index
+        uint idx_ptr = indices_base + j;
+        uint real_idx = Indices.data[idx_ptr];
+        
+        // Compute dot product Q.K[real_idx]
+        float score = 0.0;
+        
+        // Load K vector and dot
+        for (uint d=0; d<actual_head_dim; d++) {
+            uint k_ptr = ks_base + real_idx * params.head_dim + d;
+            float k_val = K.data[k_ptr];
+            
+            // RoPE K
+            if (params.has_rope != 0u) {
+                 uint rot_idx = real_idx * (params.head_dim / 2) + (d / 2);
+                 float c = RotCos.data[rot_idx];
+                 float s = RotSin.data[rot_idx];
+                 if ((d % 2) == 0) {
+                     float k_pair = K.data[k_ptr + 1];
+                     k_val = k_val * c - k_pair * s;
+                 } else {
+                     float k_pair = K.data[k_ptr - 1];
+                     k_val = k_pair * s + k_val * c;
+                 }
+            }
+            score += q_vec[d] * k_val;
+        }
+        score *= params.scale;
+        
+        // Causal
+        if (params.causal != 0u && real_idx > global_row) score = -1e30;
+        
+        // Online softmax update
+        if (is_active) {
+            float new_max = max(row_max, score);
+            float d_exp = exp(row_max - new_max);
+            float term = exp(score - new_max);
+            
+            row_sum = row_sum * d_exp + term;
+            row_max = new_max;
+            
+            // output += term * V
+            for (uint d=0; d<actual_head_dim; d++) {
+                uint v_ptr = ks_base + real_idx * params.head_dim + d;
+                float v_val = V.data[v_ptr];
+                output_vec[d] = output_vec[d] * d_exp + term * v_val;
+            }
+        }
+    }
+    
+    // Write
+    if (is_active) {
+        float inv = 1.0 / row_sum;
+        for (uint d=0; d<actual_head_dim; d++) {
+            O.data[output_off + d] = output_vec[d] * inv;
+        }
+    }
+}
