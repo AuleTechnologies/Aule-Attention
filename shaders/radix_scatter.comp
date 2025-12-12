@@ -1,24 +1,29 @@
 #version 450
 
+// Radix Scatter Shader - scatters elements to sorted positions
+// Now reads pre-computed sort keys from binding 7
+
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PushConstants {
     uint num_elements;
     uint shift;     // 0, 8, 16, 24
-    uint sort_dim;
-    uint d_model;
+    uint sort_dim;  // Unused when using pre-computed sort keys
+    uint d_model;   // Unused when using pre-computed sort keys
     uint num_segments;
     uint segment_size;
 };
 
-// Input State
+// Input State (unused for key/val movement in index-only sort)
 layout(std430, set = 0, binding = 0) readonly buffer InputKeys { float keys_in[]; };
 layout(std430, set = 0, binding = 1) readonly buffer InputVals { float vals_in[]; };
 layout(std430, set = 0, binding = 2) readonly buffer InputInds { uint inds_in[]; };
 
+// Pre-computed Sort Keys (from magnitude_sort.comp)
+layout(std430, set = 0, binding = 3) readonly buffer SortKeys { uint sort_keys_in[]; };
+
 // Outputs
-layout(std430, set = 0, binding = 3) writeonly buffer OutKeys { float keys_out[]; };
-layout(std430, set = 0, binding = 4) writeonly buffer OutVals { float vals_out[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer OutSortKeys { uint sort_keys_out[]; };
 layout(std430, set = 0, binding = 5) writeonly buffer OutInds { uint inds_out[]; };
 
 // Offsets
@@ -30,26 +35,18 @@ shared uint local_histogram[256];
 shared uint local_offsets[256];
 shared uint shared_digits[256];
 
-uint floatToRadix(float f) {
-    uint u = floatBitsToUint(f);
-    uint mask = -int(u >> 31) | 0x80000000;
-    return u ^ mask;
-}
-
 void main() {
     uint gID = gl_GlobalInvocationID.x;
     uint lID = gl_LocalInvocationID.x;
     uint wID = gl_WorkGroupID.x;
-    
-    // Segment Calculation
-    uint blocks_per_seg = segment_size / 256; 
-    if (blocks_per_seg == 0) blocks_per_seg = 1;
-    
-    uint segment_id = wID / blocks_per_seg;
+
+    // Segment Calculation - use gID for correct segment when segment_size < 256
+    uint segment_id = gID / segment_size;
     uint segment_start_idx = segment_id * segment_size;
 
     // Local Variables
     uint original_idx = 0;
+    uint sort_key = 0;
     uint digit = 0;
     uint my_rank = 0;
     bool active_thread = gID < num_elements;
@@ -57,17 +54,12 @@ void main() {
     // Initialize shared memory
     local_histogram[lID] = 0;
     barrier();
-    
-    // 1. Read Key & Compute Digit
+
+    // 1. Read Sort Key & Compute Digit
     if (active_thread) {
         original_idx = inds_in[gID];
-        
-        // Offset by Segment Start because inds are Local
-        uint key_idx = segment_start_idx + original_idx;
-        
-        float key_val = keys_in[key_idx * d_model + sort_dim];
-        uint radius_val = floatToRadix(key_val);
-        digit = (radius_val >> shift) & 0xFF; // Only need 8 bits
+        sort_key = sort_keys_in[gID];
+        digit = (sort_key >> shift) & 0xFF;
     }
 
     // 2. Stable Sort Rank Logic
@@ -105,10 +97,12 @@ void main() {
     }
     barrier();
     
-    // 3. Scatter Write
+    // 3. Scatter Write (both indices and sort keys for next pass)
     if (active_thread) {
         uint global_offset = global_offsets[wID * 256 + digit];
         uint final_rank = global_offset + my_rank;
-        inds_out[segment_start_idx + final_rank] = original_idx;
+        uint out_pos = segment_start_idx + final_rank;
+        inds_out[out_pos] = original_idx;
+        sort_keys_out[out_pos] = sort_key;
     }
 }

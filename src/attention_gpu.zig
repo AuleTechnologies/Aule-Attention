@@ -14,12 +14,24 @@ const GpuTensor = @import("gpu_tensor.zig").GpuTensor;
 
 const log = std.log.scoped(.attention_gpu);
 
+/// Shader variant selection for different performance profiles
+pub const ShaderVariant = enum(u8) {
+    baseline = 0, // Original 16x16 block, scalar loads
+    fast = 1, // Optimized 32x32 block, vec4 loads, block skipping
+    fp16 = 2, // FP16 with FP32 accumulation (requires hardware support)
+    fp16_amd = 3, // FP16 optimized for AMD 64-wide wavefronts
+};
+
 /// High-performance attention engine that operates on persistent GPU tensors
 /// Eliminates CPU<->GPU copy overhead for repeated operations
 pub const AttentionEngine = struct {
     ctx: *VulkanContext,
     buffer_manager: BufferManager,
-    pipeline: AttentionPipeline,
+    pipeline: AttentionPipeline, // Baseline shader
+    fast_pipeline: ?AttentionPipeline, // Optimized FP32 shader
+    fp16_pipeline: ?AttentionPipeline, // FP16 shader
+    fp16_amd_pipeline: ?AttentionPipeline, // FP16 AMD-optimized
+    active_variant: ShaderVariant,
     forward_lse_pipeline: ?ForwardWithLsePipeline,
     backward_pipeline: ?BackwardPipeline,
     sort_pipeline: ?SortPipeline,
@@ -35,7 +47,7 @@ pub const AttentionEngine = struct {
     pub fn init(allocator: std.mem.Allocator, generic_shader: []const u8, amd_shader: []const u8) !Self {
         // Warning: This legacy init will fail if new shaders are required by pipeline
         // We should pass null for optional shaders
-        return initWithBackward(allocator, generic_shader, amd_shader, null, null, null, null, null, null, null, null);
+        return initWithBackward(allocator, generic_shader, amd_shader, null, null, null, null, null, null, null, null, null, null, null, null);
     }
 
     pub fn initWithBackward(
@@ -50,6 +62,10 @@ pub const AttentionEngine = struct {
         radix_scan_shader: ?[]const u8,
         radix_scatter_shader: ?[]const u8,
         iota_shader: ?[]const u8,
+        magnitude_shader: ?[]const u8,
+        fast_shader: ?[]const u8,
+        fp16_shader: ?[]const u8,
+        fp16_amd_shader: ?[]const u8,
     ) !Self {
         var ctx = try allocator.create(VulkanContext);
         errdefer allocator.destroy(ctx);
@@ -59,10 +75,42 @@ pub const AttentionEngine = struct {
         const buffer_manager = BufferManager.init(ctx);
 
         const shader_code = if (ctx.gpu_caps.isAmd()) amd_shader else generic_shader;
-        log.info("Selected shader: {s}", .{if (ctx.gpu_caps.isAmd()) "AMD Optimized" else "Generic"});
+        log.info("Selected baseline shader: {s}", .{if (ctx.gpu_caps.isAmd()) "AMD Optimized" else "Generic"});
 
         var pipeline = try AttentionPipeline.init(ctx, shader_code);
         errdefer pipeline.deinit();
+
+        // Initialize optimized shader pipelines
+        var fast_pipeline: ?AttentionPipeline = null;
+        if (fast_shader) |s| {
+            fast_pipeline = try AttentionPipeline.init(ctx, s);
+            log.info("Fast FP32 shader loaded (32x32 blocks, vec4 loads, block skipping)", .{});
+        }
+
+        var fp16_pipeline: ?AttentionPipeline = null;
+        if (fp16_shader) |s| {
+            if (ctx.gpu_caps.fp16_supported) {
+                fp16_pipeline = try AttentionPipeline.init(ctx, s);
+                log.info("FP16 shader loaded", .{});
+            } else {
+                log.warn("FP16 shader requested but GPU does not support FP16", .{});
+            }
+        }
+
+        var fp16_amd_pipeline: ?AttentionPipeline = null;
+        if (fp16_amd_shader) |s| {
+            if (ctx.gpu_caps.fp16_supported and ctx.gpu_caps.isAmd()) {
+                fp16_amd_pipeline = try AttentionPipeline.init(ctx, s);
+                log.info("FP16 AMD-optimized shader loaded (64-wide wavefront)", .{});
+            }
+        }
+
+        // Select default active variant based on GPU capabilities
+        var active_variant: ShaderVariant = .baseline;
+        if (fast_pipeline != null) {
+            active_variant = .fast;
+            log.info("Default shader variant: fast (optimized)", .{});
+        }
 
         var forward_lse_pipeline: ?ForwardWithLsePipeline = null;
         if (forward_lse_shader) |s| forward_lse_pipeline = try ForwardWithLsePipeline.init(ctx, s);
@@ -73,36 +121,77 @@ pub const AttentionEngine = struct {
         var sort_pipeline: ?SortPipeline = null;
         // Only init sort pipeline if ALL radix shaders are present
         if (spatial_sort_shader != null and radix_count_shader != null and radix_scan_shader != null and radix_scatter_shader != null and iota_shader != null) {
-            sort_pipeline = try SortPipeline.init(ctx, 
+            sort_pipeline = try SortPipeline.initWithMagnitude(ctx,
                 spatial_sort_shader.?,
                 radix_count_shader.?,
                 radix_scan_shader.?,
                 radix_scatter_shader.?,
-                iota_shader.?
+                iota_shader.?,
+                magnitude_shader // Optional magnitude shader for improved sorting
             );
-            log.info("Sort pipeline initialized (Radix enabled)", .{});
+            log.info("Sort pipeline initialized (Radix enabled, magnitude={s})", .{if (magnitude_shader != null) "yes" else "no"});
         } else if (spatial_sort_shader) |s| {
              _ = s; // Unused
-             // Fallback for passing just one shader (this will crash the new init? No, we need separate logic or dummy shaders)
-             // The new SortPipeline.init requires 5 args.
-             // We cannot support legacy init easily unless we overload or change SortPipeline.
-             // Let's assume for now we provide all or nothing for Radix support.
-             // If missing radix shaders, we skip sort pipeline.
              log.warn("Missing Radix Sort shaders, SortPipeline skipped", .{});
         }
 
         var gravity_pipeline: ?GravityPipeline = null;
         if (gravity_shader) |s| gravity_pipeline = try GravityPipeline.init(ctx, s);
-        
+
         return Self{
             .ctx = ctx,
             .buffer_manager = buffer_manager,
             .pipeline = pipeline,
+            .fast_pipeline = fast_pipeline,
+            .fp16_pipeline = fp16_pipeline,
+            .fp16_amd_pipeline = fp16_amd_pipeline,
+            .active_variant = active_variant,
             .forward_lse_pipeline = forward_lse_pipeline,
             .backward_pipeline = backward_pipeline,
             .sort_pipeline = sort_pipeline,
             .gravity_pipeline = gravity_pipeline,
             .allocator = allocator,
+        };
+    }
+
+    /// Set the active shader variant for attention computation
+    /// Returns error if the requested variant is not available
+    pub fn setShaderVariant(self: *Self, variant: ShaderVariant) !void {
+        switch (variant) {
+            .baseline => {
+                self.active_variant = .baseline;
+                log.info("Switched to baseline shader", .{});
+            },
+            .fast => {
+                if (self.fast_pipeline == null) return error.ShaderVariantNotAvailable;
+                self.active_variant = .fast;
+                log.info("Switched to fast FP32 shader", .{});
+            },
+            .fp16 => {
+                if (self.fp16_pipeline == null) return error.ShaderVariantNotAvailable;
+                self.active_variant = .fp16;
+                log.info("Switched to FP16 shader", .{});
+            },
+            .fp16_amd => {
+                if (self.fp16_amd_pipeline == null) return error.ShaderVariantNotAvailable;
+                self.active_variant = .fp16_amd;
+                log.info("Switched to FP16 AMD-optimized shader", .{});
+            },
+        }
+    }
+
+    /// Get the currently active shader variant
+    pub fn getShaderVariant(self: *const Self) ShaderVariant {
+        return self.active_variant;
+    }
+
+    /// Get the active pipeline based on current variant
+    fn getActivePipeline(self: *const Self) *const AttentionPipeline {
+        return switch (self.active_variant) {
+            .baseline => &self.pipeline,
+            .fast => if (self.fast_pipeline) |*p| p else &self.pipeline,
+            .fp16 => if (self.fp16_pipeline) |*p| p else &self.pipeline,
+            .fp16_amd => if (self.fp16_amd_pipeline) |*p| p else &self.pipeline,
         };
     }
 
@@ -159,21 +248,42 @@ pub const AttentionEngine = struct {
         }
         const inds_temp = self.radix_inds_temp.?;
 
+        // Sort keys buffers (for magnitude-based or projection-based sorting)
+        const sort_keys_size = num_elements * 4;
+        var sort_keys_final = try self.buffer_manager.createBuffer(sort_keys_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
+        defer self.buffer_manager.destroyBuffer(&sort_keys_final);
+        var sort_keys_temp = try self.buffer_manager.createBuffer(sort_keys_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
+        defer self.buffer_manager.destroyBuffer(&sort_keys_temp);
+
         // 2. Initialize Indices to 0..S-1 per segment
         const S = keys.shape[2];
         const num_segments = keys.shape[0] * keys.shape[1];
         try sort_pipe.dispatchIota(indices.getBuffer(), num_elements, @intCast(S));
 
-        // 3. Perform Radix Sort (4 passes)
+        // 3. Compute sort keys (magnitude-based if available)
+        if (sort_pipe.hasMagnitudeSort()) {
+            try sort_pipe.dispatchMagnitude(
+                keys.getBuffer(),
+                indices.getBuffer(),
+                sort_keys_final.buffer,
+                num_elements,
+                d_model,
+                @intCast(num_segments),
+                @intCast(S)
+            );
+        }
+
+        // 4. Perform Radix Sort (4 passes)
         std.debug.print("DEBUG: dispatchRadix PRE-CALL. d_model={}, num_elements={}, S={}\n", .{d_model, num_elements, S});
         if (d_model == 0) return error.InvalidDModel;
 
-        // Note: dispatchRadix handles descriptor updates internally now.
         try sort_pipe.dispatchRadix(
             keys.getBuffer(),
             values.getBuffer(),
             indices.getBuffer(),
             inds_temp.buffer,
+            sort_keys_final.buffer,
+            sort_keys_temp.buffer,
             hist_buf.buffer,
             num_elements,
             d_model,
@@ -190,6 +300,10 @@ pub const AttentionEngine = struct {
         if (self.gravity_pipeline) |*gp| gp.deinit();
         if (self.radix_hist_buffer) |*b| self.buffer_manager.destroyBuffer(b);
         if (self.radix_inds_temp) |*b| self.buffer_manager.destroyBuffer(b);
+        // Deinit all shader pipelines
+        if (self.fast_pipeline) |*p| p.deinit();
+        if (self.fp16_pipeline) |*p| p.deinit();
+        if (self.fp16_amd_pipeline) |*p| p.deinit();
         self.pipeline.deinit();
         self.ctx.deinit();
         self.allocator.destroy(self.ctx);
@@ -209,6 +323,7 @@ pub const AttentionEngine = struct {
 
     /// Compute attention directly on GPU tensors - NO CPU<->GPU COPY
     /// Q, K, V must already be on GPU, output will be written to GPU tensor
+    /// window_size: sliding window size (-1 for full attention)
     pub fn forward(
         self: *Self,
         Q: *const GpuTensor,
@@ -218,6 +333,7 @@ pub const AttentionEngine = struct {
         rot_cos: ?*const GpuTensor,
         rot_sin: ?*const GpuTensor,
         causal: bool,
+        window_size: i32,
     ) !void {
         // Validate shapes match
         if (Q.ndim != 4 or K.ndim != 4 or V.ndim != 4 or output.ndim != 4) {
@@ -274,8 +390,11 @@ pub const AttentionEngine = struct {
             return error.MissingRotaryCos;
         }
 
+        // Get the active pipeline based on shader variant
+        const active_pipe = self.getActivePipeline();
+
         // Update descriptors to point to the GPU tensors
-        self.pipeline.updateDescriptors(
+        active_pipe.updateDescriptors(
             Q.getBuffer(),
             K.getBuffer(),
             V.getBuffer(),
@@ -292,12 +411,12 @@ pub const AttentionEngine = struct {
         const num_kv_heads = K.shape[1];
         const key_seq_len = K.shape[2];
 
-        log.info("Dispatching: B={d}, H={d}, KVH={d}, QLen={d}, KLen={d}", .{
-            batch_size, num_heads, num_kv_heads, seq_len, key_seq_len
+        log.info("Dispatching ({s}): B={d}, H={d}, KVH={d}, QLen={d}, KLen={d}", .{
+            @tagName(self.active_variant), batch_size, num_heads, num_kv_heads, seq_len, key_seq_len
         });
 
         // Dispatch - data stays on GPU!
-        try self.pipeline.dispatch(batch_size, num_heads, num_kv_heads, seq_len, key_seq_len, head_dim, causal, has_rope);
+        try active_pipe.dispatch(batch_size, num_heads, num_kv_heads, seq_len, key_seq_len, head_dim, causal, has_rope, window_size);
     }
 
     /// Convenience: forward with automatic sync
@@ -310,8 +429,9 @@ pub const AttentionEngine = struct {
         rot_cos: ?*const GpuTensor,
         rot_sin: ?*const GpuTensor,
         causal: bool,
+        window_size: i32,
     ) !void {
-        try self.forward(Q, K, V, output, rot_cos, rot_sin, causal);
+        try self.forward(Q, K, V, output, rot_cos, rot_sin, causal, window_size);
         try self.ctx.waitIdle();
     }
 
@@ -455,6 +575,7 @@ pub const AttentionEngine = struct {
 
 
     /// Gravity Attention: Indirect attention using sorted indices
+    /// window_size: sliding window size (-1 for full attention)
     pub fn forwardGravity(
         self: *Self,
         Q: *const GpuTensor,
@@ -466,9 +587,9 @@ pub const AttentionEngine = struct {
         indices: *GpuTensor,
         causal: bool,
         max_attend: u32,
+        window_size: i32,
     ) !void {
         const gravity_pipe = self.gravity_pipeline orelse return error.GravityPipelineNotInitialized;
-        const sort_pipe = self.sort_pipeline orelse return error.SortPipelineNotInitialized;
 
         // Validations
         if (Q.ndim != 4 or K.ndim != 4 or V.ndim != 4 or output.ndim != 4) return error.InvalidShape;
@@ -498,42 +619,72 @@ pub const AttentionEngine = struct {
         const num_kv_heads = K.shape[1];
         const key_seq_len = K.shape[2];
 
-        // --- SORTING PHASE ---
-        {
-             // 1. Allocate Temp Buffers for Sort
-             const num_elements = batch_size * num_kv_heads * key_seq_len;
-             const WORKGROUP = 256;
-             const num_workgroups = (num_elements + WORKGROUP - 1) / WORKGROUP;
-             
-             // Histograms: [NumGroups * 256] (u32)
-             const hist_size = num_workgroups * 256 * 4;
-             var hist_buf = try self.buffer_manager.createBuffer(hist_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
-             defer self.buffer_manager.destroyBuffer(&hist_buf);
-             
-             // Temp Indices for Ping-Pong
-             const inds_size = num_elements * 4;
-             var inds_temp = try self.buffer_manager.createBuffer(inds_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
-             defer self.buffer_manager.destroyBuffer(&inds_temp);
-             
-             // 2. Dispatch Iota (Initialize Indices)
-             const S = key_seq_len;
-             const num_segments = batch_size * num_kv_heads;
-             try sort_pipe.dispatchIota(indices.getBuffer(), num_elements, @intCast(S));
-             
-             // 3. Dispatch Radix Sort
-             // Use sort_dim = 0 for now (default)
-             try sort_pipe.dispatchRadix(
-                K.getBuffer(),
-                V.getBuffer(), // Passed but assumed unused for value movement
-                indices.getBuffer(), // Final
-                inds_temp.buffer,    // Temp
-                hist_buf.buffer,     // Hist
-                num_elements,
-                head_dim, // d_model
-                0,        // Sort Dim 0
-                @intCast(num_segments),
-                @intCast(S)
-             );
+        // Check if indices are per-Q-head (shape B*H*S) or per-KV-head (B*KVH*S)
+        // If indices have the right element count for Q-heads and were uploaded from Python,
+        // skip the internal sorting phase - the caller provided pre-sorted indices.
+        const expected_indices_for_q_heads = batch_size * num_heads * key_seq_len;
+        const provided_indices_count = indices.element_count;
+        const skip_sorting = (provided_indices_count == expected_indices_for_q_heads);
+
+        if (!skip_sorting) {
+            // --- SORTING PHASE (when indices not pre-provided) ---
+            const sort_pipe = self.sort_pipeline orelse return error.SortPipelineNotInitialized;
+
+            // 1. Allocate Temp Buffers for Sort
+            const num_elements = batch_size * num_kv_heads * key_seq_len;
+            const WORKGROUP = 256;
+            const num_workgroups = (num_elements + WORKGROUP - 1) / WORKGROUP;
+
+            // Histograms: [NumGroups * 256] (u32)
+            const hist_size = num_workgroups * 256 * 4;
+            var hist_buf = try self.buffer_manager.createBuffer(hist_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
+            defer self.buffer_manager.destroyBuffer(&hist_buf);
+
+            // Temp Indices for Ping-Pong
+            const inds_size = num_elements * 4;
+            var inds_temp = try self.buffer_manager.createBuffer(inds_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
+            defer self.buffer_manager.destroyBuffer(&inds_temp);
+
+            // Sort Keys buffers for ping-pong (magnitude-based sorting)
+            const sort_keys_size = num_elements * 4; // uint per element
+            var sort_keys_final = try self.buffer_manager.createBuffer(sort_keys_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
+            defer self.buffer_manager.destroyBuffer(&sort_keys_final);
+            var sort_keys_temp = try self.buffer_manager.createBuffer(sort_keys_size, .{ .storage_buffer_bit = true }, .{ .device_local_bit = true });
+            defer self.buffer_manager.destroyBuffer(&sort_keys_temp);
+
+            // 2. Dispatch Iota (Initialize Indices to 0..S-1 per segment)
+            const S = key_seq_len;
+            const num_segments = batch_size * num_kv_heads;
+            try sort_pipe.dispatchIota(indices.getBuffer(), num_elements, @intCast(S));
+
+            // 3. Compute magnitude-based sort keys (if available)
+            if (sort_pipe.hasMagnitudeSort()) {
+                try sort_pipe.dispatchMagnitude(
+                    K.getBuffer(),
+                    indices.getBuffer(),
+                    sort_keys_final.buffer,
+                    num_elements,
+                    head_dim, // d_model
+                    @intCast(num_segments),
+                    @intCast(S)
+                );
+            }
+
+            // 4. Dispatch Radix Sort using pre-computed sort keys
+            try sort_pipe.dispatchRadix(
+               K.getBuffer(),
+               V.getBuffer(),
+               indices.getBuffer(),      // Final indices
+               inds_temp.buffer,         // Temp indices
+               sort_keys_final.buffer,   // Final sort keys
+               sort_keys_temp.buffer,    // Temp sort keys
+               hist_buf.buffer,          // Histograms
+               num_elements,
+               head_dim, // d_model
+               0,        // Sort Dim (unused with magnitude sort)
+               @intCast(num_segments),
+               @intCast(S)
+            );
         }
         // --- END SORTING PHASE ---
 
@@ -554,7 +705,7 @@ pub const AttentionEngine = struct {
         );
         
         try gravity_pipe.dispatch(
-             batch_size, num_heads, num_kv_heads, seq_len, key_seq_len, head_dim, causal, has_rope, max_attend
+             batch_size, num_heads, num_kv_heads, seq_len, key_seq_len, head_dim, causal, has_rope, max_attend, window_size
         );
     }
 };

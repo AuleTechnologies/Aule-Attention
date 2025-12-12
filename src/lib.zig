@@ -13,7 +13,8 @@ var global_ctx: ?AttentionContext = null;
 var global_allocator: std.mem.Allocator = std.heap.c_allocator;
 
 // Tensor storage (simple array for handles)
-const MAX_TENSORS = 256;
+// Increased from 256 to 1024 for longer inference sessions
+const MAX_TENSORS = 1024;
 var tensor_storage: [MAX_TENSORS]?*Tensor = [_]?*Tensor{null} ** MAX_TENSORS;
 
 // Error message buffer
@@ -35,6 +36,17 @@ const radix_count_spv = @embedFile("radix_count_spv");
 const radix_scan_spv = @embedFile("radix_scan_spv");
 const radix_scatter_spv = @embedFile("radix_scatter_spv");
 const iota_spv = @embedFile("iota_spv");
+const magnitude_sort_spv = @embedFile("magnitude_sort_spv");
+
+// FP16 shaders (for supported GPUs)
+const attention_f16_spv = @embedFile("attention_f16_spv");
+const attention_f16_amd_spv = @embedFile("attention_f16_amd_spv");
+
+// Optimized FP32 shader (vectorized loads, block skipping)
+const attention_f32_fast_spv = @embedFile("attention_f32_fast_spv");
+
+// Re-export ShaderVariant for external use
+pub const ShaderVariant = @import("attention_gpu.zig").ShaderVariant;
 
 // ============================================================================
 // C API
@@ -59,6 +71,10 @@ export fn aule_init() callconv(.C) i32 {
         radix_scan_spv,
         radix_scatter_spv,
         iota_spv,
+        magnitude_sort_spv,
+        attention_f32_fast_spv, // Optimized FP32 shader
+        attention_f16_spv, // FP16 shader
+        attention_f16_amd_spv, // FP16 AMD-optimized
     ) catch |err| {
         setError("Failed to initialize backend: {}", .{err});
         log.err("Backend init failed: {}", .{err});
@@ -140,24 +156,7 @@ export fn aule_get_vendor() callconv(.C) i32 {
     return -1; // Not initialized
 }
 
-/// Get GPU device name
-export fn aule_get_device_name() callconv(.C) [*:0]const u8 {
-    if (global_ctx) |*ctx| {
-        switch (ctx.backend) {
-            .vulkan => {
-                if (ctx.vulkan_ctx) |vctx| {
-                    const name = vctx.ctx.gpu_caps.getDeviceName();
-                    @memcpy(global_error_message[0..name.len], name);
-                    global_error_message[name.len] = 0;
-                    return @ptrCast(&global_error_message);
-                }
-            },
-            .hip => return "AMD HIP Device",
-            .cpu => return "CPU",
-        }
-    }
-    return "Not initialized";
-}
+// Old aule_get_device_name removed - use new version with buffer parameter below
 
 /// Check if AMD-optimized shader is being used
 export fn aule_is_amd_optimized() callconv(.C) i32 {
@@ -185,6 +184,102 @@ export fn aule_has_fp16() callconv(.C) i32 {
                 }
             },
             .hip => return 1, // HIP GPUs typically support FP16
+            .cpu => return 0,
+        }
+    }
+    return -1;
+}
+
+/// Set shader variant for attention computation
+/// 0 = baseline, 1 = fast (optimized FP32), 2 = fp16, 3 = fp16_amd
+/// Returns 0 on success, -1 if not initialized, -2 if variant not available
+export fn aule_set_shader_variant(variant: u8) callconv(.C) i32 {
+    if (global_ctx) |*ctx| {
+        if (ctx.vulkan_ctx) |engine| {
+            const shader_variant = std.meta.intToEnum(ShaderVariant, variant) catch return -2;
+            engine.setShaderVariant(shader_variant) catch return -2;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/// Get current shader variant
+/// Returns variant id (0-3) or -1 if not initialized
+export fn aule_get_shader_variant() callconv(.C) i32 {
+    if (global_ctx) |*ctx| {
+        if (ctx.vulkan_ctx) |engine| {
+            return @intFromEnum(engine.getShaderVariant());
+        }
+    }
+    return -1;
+}
+
+/// Check if a shader variant is available
+/// Returns 1 if available, 0 if not, -1 if not initialized
+export fn aule_has_shader_variant(variant: u8) callconv(.C) i32 {
+    if (global_ctx) |*ctx| {
+        if (ctx.vulkan_ctx) |engine| {
+            const shader_variant = std.meta.intToEnum(ShaderVariant, variant) catch return 0;
+            return switch (shader_variant) {
+                .baseline => 1, // Always available
+                .fast => if (engine.fast_pipeline != null) @as(i32, 1) else 0,
+                .fp16 => if (engine.fp16_pipeline != null) @as(i32, 1) else 0,
+                .fp16_amd => if (engine.fp16_amd_pipeline != null) @as(i32, 1) else 0,
+            };
+        }
+    }
+    return -1;
+}
+
+/// Get device name (null-terminated string)
+export fn aule_get_device_name(buffer: [*]u8, buffer_len: u32) callconv(.C) i32 {
+    if (global_ctx) |*ctx| {
+        switch (ctx.backend) {
+            .vulkan => {
+                if (ctx.vulkan_ctx) |vctx| {
+                    const name = vctx.ctx.gpu_caps.getDeviceName();
+                    const copy_len = @min(name.len, buffer_len - 1);
+                    @memcpy(buffer[0..copy_len], name[0..copy_len]);
+                    buffer[copy_len] = 0;
+                    return @intCast(copy_len);
+                }
+            },
+            .hip => {
+                const name = "HIP Device";
+                const copy_len = @min(name.len, buffer_len - 1);
+                @memcpy(buffer[0..copy_len], name[0..copy_len]);
+                buffer[copy_len] = 0;
+                return @intCast(copy_len);
+            },
+            .cpu => {
+                const name = "CPU";
+                const copy_len = @min(name.len, buffer_len - 1);
+                @memcpy(buffer[0..copy_len], name[0..copy_len]);
+                buffer[copy_len] = 0;
+                return @intCast(copy_len);
+            },
+        }
+    }
+    return -1;
+}
+
+/// Get GPU vendor: 0=unknown, 1=AMD, 2=NVIDIA, 3=Intel, 4=Apple
+export fn aule_get_gpu_vendor() callconv(.C) i32 {
+    if (global_ctx) |*ctx| {
+        switch (ctx.backend) {
+            .vulkan => {
+                if (ctx.vulkan_ctx) |vctx| {
+                    return switch (vctx.ctx.gpu_caps.vendor) {
+                        .other => 0,
+                        .amd => 1,
+                        .nvidia => 2,
+                        .intel => 3,
+                        .apple => 4,
+                    };
+                }
+            },
+            .hip => return 1, // AMD
             .cpu => return 0,
         }
     }
@@ -253,8 +348,8 @@ export fn aule_attention_forward(
     ctx.upload(k_ptr, key[0..count]) catch |err| { setError("Upload K failed: {}", .{err}); return -3; };
     ctx.upload(v_ptr, value[0..count]) catch |err| { setError("Upload V failed: {}", .{err}); return -3; };
 
-    // 3. Compute
-    ctx.attention(q_ptr, k_ptr, v_ptr, o_ptr, null, null, causal != 0) catch |err| {
+    // 3. Compute (no sliding window for basic API)
+    ctx.attention(q_ptr, k_ptr, v_ptr, o_ptr, null, null, causal != 0, -1) catch |err| {
         setError("Attention failed: {}", .{err});
         return -4;
     };
@@ -276,6 +371,33 @@ fn allocTensorSlot() ?usize {
         if (slot == null) return i;
     }
     return null;
+}
+
+/// Get number of active tensors
+export fn aule_tensor_count() callconv(.C) u32 {
+    var count: u32 = 0;
+    for (tensor_storage) |slot| {
+        if (slot != null) count += 1;
+    }
+    return count;
+}
+
+/// Get max tensor slots available
+export fn aule_tensor_max() callconv(.C) u32 {
+    return MAX_TENSORS;
+}
+
+/// Clear all tensors (force reset)
+export fn aule_tensor_clear_all() callconv(.C) void {
+    for (&tensor_storage) |*slot| {
+        if (slot.*) |tensor| {
+            if (global_ctx) |*ctx| {
+                ctx.destroyTensor(tensor);
+                global_allocator.destroy(tensor);
+            }
+            slot.* = null;
+        }
+    }
 }
 
 export fn aule_tensor_create(
@@ -373,26 +495,27 @@ export fn aule_attention_forward_gpu(
     rot_cos_handle: TensorHandle,
     rot_sin_handle: TensorHandle,
     causal: i32,
+    window_size: i32,
 ) callconv(.C) i32 {
     var ctx = global_ctx orelse return -1;
-    
+
     const q = tensor_storage[@intCast(q_handle - 1)] orelse return -1;
     const k = tensor_storage[@intCast(k_handle - 1)] orelse return -1;
     const v = tensor_storage[@intCast(v_handle - 1)] orelse return -1;
     const o = tensor_storage[@intCast(output_handle - 1)] orelse return -1;
-    
+
     // Optional handles (0 means null)
     var rot_cos: ?*Tensor = null;
     if (rot_cos_handle != 0) {
         rot_cos = tensor_storage[@intCast(rot_cos_handle - 1)];
     }
-    
+
     var rot_sin: ?*Tensor = null;
     if (rot_sin_handle != 0) {
         rot_sin = tensor_storage[@intCast(rot_sin_handle - 1)];
     }
 
-    ctx.attention(q, k, v, o, rot_cos, rot_sin, causal != 0) catch |err| {
+    ctx.attention(q, k, v, o, rot_cos, rot_sin, causal != 0, window_size) catch |err| {
         setError("Attention failed: {}", .{err});
         return -3;
     };
@@ -428,27 +551,28 @@ export fn aule_attention_forward_gravity(
     indices_handle: TensorHandle,
     causal: i32,
     max_attend: u32,
+    window_size: i32,
 ) callconv(.C) i32 {
     var ctx = global_ctx orelse return -1;
-    
+
     const q = tensor_storage[@intCast(q_handle - 1)] orelse return -1;
     const k = tensor_storage[@intCast(k_handle - 1)] orelse return -1;
     const v = tensor_storage[@intCast(v_handle - 1)] orelse return -1;
     const o = tensor_storage[@intCast(output_handle - 1)] orelse return -1;
     const indices = tensor_storage[@intCast(indices_handle - 1)] orelse return -1;
-    
+
     // Optional handles (0 means null)
     var rot_cos: ?*Tensor = null;
     if (rot_cos_handle != 0) {
         rot_cos = tensor_storage[@intCast(rot_cos_handle - 1)];
     }
-    
+
     var rot_sin: ?*Tensor = null;
     if (rot_sin_handle != 0) {
         rot_sin = tensor_storage[@intCast(rot_sin_handle - 1)];
     }
 
-    ctx.forwardGravity(q, k, v, o, rot_cos, rot_sin, indices, causal != 0, max_attend) catch |err| {
+    ctx.forwardGravity(q, k, v, o, rot_cos, rot_sin, indices, causal != 0, max_attend, window_size) catch |err| {
         setError("Gravity Attention failed: {}", .{err});
         log.err("Gravity Attention failed: {}", .{err});
         return -3;
@@ -773,8 +897,8 @@ pub const Attention = struct {
         try self.context.upload(k_ptr, K[0..count]);
         try self.context.upload(v_ptr, V[0..count]);
 
-        // 3. Compute (no RoPE for basic tests)
-        try self.context.attention(q_ptr, k_ptr, v_ptr, o_ptr, null, null, causal);
+        // 3. Compute (no RoPE, no sliding window for basic tests)
+        try self.context.attention(q_ptr, k_ptr, v_ptr, o_ptr, null, null, causal, -1);
 
         // 4. Download
         try self.context.download(o_ptr, output[0..count]);

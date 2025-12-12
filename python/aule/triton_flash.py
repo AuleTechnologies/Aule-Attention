@@ -376,11 +376,21 @@ class FlashAttentionTritonFunc(torch.autograd.Function):
         if scale is None:
             scale = 1.0 / math.sqrt(head_dim)
 
-        # Ensure contiguous and same dtype
+        # Ensure contiguous - keep native dtype for FP16/BF16 compute
         orig_dtype = q.dtype
-        q = q.contiguous().float()
-        k = k.contiguous().float()
-        v = v.contiguous().float()
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        # Use native FP16/BF16 for compute if input is FP16/BF16 (faster on modern GPUs)
+        # Fall back to FP32 for FP32 input or other dtypes
+        if orig_dtype in (torch.float16, torch.bfloat16):
+            compute_dtype = orig_dtype
+        else:
+            compute_dtype = torch.float32
+            q = q.float()
+            k = k.float()
+            v = v.float()
 
         # RoPE handling
         use_rope = cos is not None and sin is not None

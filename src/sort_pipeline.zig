@@ -30,18 +30,30 @@ pub const SortPipeline = struct {
     scan_pipeline: vk.Pipeline,
     scatter_pipeline: vk.Pipeline,
     iota_pipeline: vk.Pipeline,
+    magnitude_pipeline: ?vk.Pipeline, // Optional magnitude sort key computation
     descriptor_pool: vk.DescriptorPool,
     descriptor_sets: [2]vk.DescriptorSet, // 0: Final->Temp, 1: Temp->Final
     command_pool: vk.CommandPool,
     command_buffer: vk.CommandBuffer,
     fence: vk.Fence,
 
-    pub fn init(ctx: *const VulkanContext, 
+    pub fn init(ctx: *const VulkanContext,
         spatial_code: []const u8,
         count_code: []const u8,
         scan_code: []const u8,
         scatter_code: []const u8,
         iota_code: []const u8,
+    ) !Self {
+        return initWithMagnitude(ctx, spatial_code, count_code, scan_code, scatter_code, iota_code, null);
+    }
+
+    pub fn initWithMagnitude(ctx: *const VulkanContext,
+        spatial_code: []const u8,
+        count_code: []const u8,
+        scan_code: []const u8,
+        scatter_code: []const u8,
+        iota_code: []const u8,
+        magnitude_code: ?[]const u8,
     ) !Self {
 
         // ... (create pipelines/layout same as before) ...
@@ -98,6 +110,12 @@ pub const SortPipeline = struct {
         const scatter_pipeline = try createPipeline(ctx, scatter_code, pl);
         const iota_pipeline = try createPipeline(ctx, iota_code, pl);
 
+        // Optional magnitude pipeline for improved sorting
+        var magnitude_pipeline: ?vk.Pipeline = null;
+        if (magnitude_code) |code| {
+            magnitude_pipeline = try createPipeline(ctx, code, pl);
+        }
+
         // Pool: Need 2 sets * 7 bindings = 14 descriptors
         const pool_size = vk.DescriptorPoolSize{ .type = .storage_buffer, .descriptor_count = 16 };
         const pool = try ctx.vkd.createDescriptorPool(ctx.device, &.{ .max_sets = 2, .pool_size_count = 1, .p_pool_sizes = @ptrCast(&pool_size) }, null);
@@ -121,6 +139,7 @@ pub const SortPipeline = struct {
             .scan_pipeline = scan_pipeline,
             .scatter_pipeline = scatter_pipeline,
             .iota_pipeline = iota_pipeline,
+            .magnitude_pipeline = magnitude_pipeline,
             .pipeline_layout = pl,
             .descriptor_set_layout = dsl,
             .descriptor_pool = pool,
@@ -170,41 +189,111 @@ pub const SortPipeline = struct {
         try self.ctx.vkd.deviceWaitIdle(self.ctx.device);
     }
 
-    // New Update Helper: Wires up both sets
+    // Dispatch Magnitude: Compute sort keys from key magnitudes (L2 norm)
+    // This produces sort keys that can be used by the radix sort
+    pub fn dispatchMagnitude(
+        self: *const Self,
+        keys_buffer: vk.Buffer,      // Input keys [N, D]
+        indices_buffer: vk.Buffer,   // Current index permutation
+        sort_keys_buffer: vk.Buffer, // Output sort keys (uint)
+        num_elements: u32,
+        d_model: u32,
+        num_segments: u32,
+        segment_size: u32,
+    ) !void {
+        const magnitude_pipe = self.magnitude_pipeline orelse return error.MagnitudePipelineNotInitialized;
+
+        try self.ctx.vkd.resetCommandBuffer(self.command_buffer, .{});
+        try self.ctx.vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
+
+        // Update descriptors for magnitude shader
+        // Binding 0: Keys input
+        // Binding 2: Indices input
+        // Binding 3: Sort keys output
+        const set = self.descriptor_sets[0];
+        const b_keys = vk.DescriptorBufferInfo{ .buffer = keys_buffer, .offset = 0, .range = vk.WHOLE_SIZE };
+        const b_inds = vk.DescriptorBufferInfo{ .buffer = indices_buffer, .offset = 0, .range = vk.WHOLE_SIZE };
+        const b_sort_keys = vk.DescriptorBufferInfo{ .buffer = sort_keys_buffer, .offset = 0, .range = vk.WHOLE_SIZE };
+
+        const writes = [_]vk.WriteDescriptorSet{
+            .{ .dst_set = set, .dst_binding = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_keys), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
+            .{ .dst_set = set, .dst_binding = 2, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_inds), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
+            .{ .dst_set = set, .dst_binding = 3, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_sort_keys), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
+        };
+        self.ctx.vkd.updateDescriptorSets(self.ctx.device, writes.len, &writes, 0, null);
+
+        self.ctx.vkd.cmdBindPipeline(self.command_buffer, .compute, magnitude_pipe);
+        self.ctx.vkd.cmdBindDescriptorSets(self.command_buffer, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+
+        const pc = SortPushConstants{
+            .num_elements = num_elements,
+            .shift = 0, // Unused for magnitude
+            .sort_dim = 0, // Unused for magnitude
+            .d_model = d_model,
+            .num_segments = num_segments,
+            .segment_size = segment_size,
+        };
+        self.ctx.vkd.cmdPushConstants(self.command_buffer, self.pipeline_layout, .{ .compute_bit = true }, 0, @sizeOf(SortPushConstants), std.mem.asBytes(&pc));
+
+        const workgroups = (num_elements + 255) / 256;
+        self.ctx.vkd.cmdDispatch(self.command_buffer, workgroups, 1, 1);
+
+        try self.ctx.vkd.endCommandBuffer(self.command_buffer);
+
+        try self.ctx.vkd.resetFences(self.ctx.device, 1, @ptrCast(&self.fence));
+        const submit = vk.SubmitInfo{ .command_buffer_count = 1, .p_command_buffers = @ptrCast(&self.command_buffer) };
+        try self.ctx.vkd.queueSubmit(self.ctx.compute_queue, 1, @ptrCast(&submit), self.fence);
+        try self.ctx.vkd.deviceWaitIdle(self.ctx.device);
+    }
+
+    // Check if magnitude-based sorting is available
+    pub fn hasMagnitudeSort(self: *const Self) bool {
+        return self.magnitude_pipeline != null;
+    }
+
+    // Update Helper: Wires up both descriptor sets for ping-pong radix sort
+    // Now includes sort_keys buffers for magnitude-based sorting
     pub fn updateDescriptorsRadix(
         self: *const Self,
-        keys_in: vk.Buffer,
-        vals_in: vk.Buffer,
-        inds_final: vk.Buffer, // Set 0: Input, Set 1: Output
-        inds_temp: vk.Buffer,  // Set 0: Output, Set 1: Input
+        keys_in: vk.Buffer,         // Original key embeddings (for magnitude shader)
+        vals_in: vk.Buffer,         // Original values (unused in index-only sort)
+        inds_final: vk.Buffer,      // Indices: Set 0 Input, Set 1 Output
+        inds_temp: vk.Buffer,       // Indices: Set 0 Output, Set 1 Input
+        sort_keys_final: vk.Buffer, // Sort keys: Set 0 Input, Set 1 Output
+        sort_keys_temp: vk.Buffer,  // Sort keys: Set 0 Output, Set 1 Input
         histograms: vk.Buffer,
         size: vk.DeviceSize,
     ) void {
         const full = vk.WHOLE_SIZE;
-        // Common infos
+        // Buffer infos
         const b_keys = vk.DescriptorBufferInfo{ .buffer = keys_in, .offset = 0, .range = size };
         const b_vals = vk.DescriptorBufferInfo{ .buffer = vals_in, .offset = 0, .range = size };
-        const b_final = vk.DescriptorBufferInfo{ .buffer = inds_final, .offset = 0, .range = full };
-        const b_temp = vk.DescriptorBufferInfo{ .buffer = inds_temp, .offset = 0, .range = full };
+        const b_inds_final = vk.DescriptorBufferInfo{ .buffer = inds_final, .offset = 0, .range = full };
+        const b_inds_temp = vk.DescriptorBufferInfo{ .buffer = inds_temp, .offset = 0, .range = full };
+        const b_sk_final = vk.DescriptorBufferInfo{ .buffer = sort_keys_final, .offset = 0, .range = full };
+        const b_sk_temp = vk.DescriptorBufferInfo{ .buffer = sort_keys_temp, .offset = 0, .range = full };
         const b_hist = vk.DescriptorBufferInfo{ .buffer = histograms, .offset = 0, .range = full };
 
-        // Set 0: Final -> Temp
-        // Bind 2 (In) = Final, Bind 5 (Out) = Temp
+        // Set 0: Final -> Temp (reads from final, writes to temp)
+        // Bindings: 0=keys, 1=vals, 2=inds_in, 3=sort_keys_in, 4=sort_keys_out, 5=inds_out, 6=hist
         const w0 = [_]vk.WriteDescriptorSet{
             .{ .dst_set = self.descriptor_sets[0], .dst_binding = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_keys), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
             .{ .dst_set = self.descriptor_sets[0], .dst_binding = 1, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_vals), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
-            .{ .dst_set = self.descriptor_sets[0], .dst_binding = 2, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_final), .dst_array_element = 0, .p_image_info = undefined,.p_texel_buffer_view = undefined },
-            .{ .dst_set = self.descriptor_sets[0], .dst_binding = 5, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_temp), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
+            .{ .dst_set = self.descriptor_sets[0], .dst_binding = 2, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_inds_final), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
+            .{ .dst_set = self.descriptor_sets[0], .dst_binding = 3, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_sk_final), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
+            .{ .dst_set = self.descriptor_sets[0], .dst_binding = 4, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_sk_temp), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
+            .{ .dst_set = self.descriptor_sets[0], .dst_binding = 5, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_inds_temp), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
             .{ .dst_set = self.descriptor_sets[0], .dst_binding = 6, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_hist), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
         };
 
-        // Set 1: Temp -> Final
-        // Bind 2 (In) = Temp, Bind 5 (Out) = Final
+        // Set 1: Temp -> Final (reads from temp, writes to final)
         const w1 = [_]vk.WriteDescriptorSet{
             .{ .dst_set = self.descriptor_sets[1], .dst_binding = 0, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_keys), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
             .{ .dst_set = self.descriptor_sets[1], .dst_binding = 1, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_vals), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
-            .{ .dst_set = self.descriptor_sets[1], .dst_binding = 2, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_temp), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
-            .{ .dst_set = self.descriptor_sets[1], .dst_binding = 5, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_final), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
+            .{ .dst_set = self.descriptor_sets[1], .dst_binding = 2, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_inds_temp), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
+            .{ .dst_set = self.descriptor_sets[1], .dst_binding = 3, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_sk_temp), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
+            .{ .dst_set = self.descriptor_sets[1], .dst_binding = 4, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_sk_final), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
+            .{ .dst_set = self.descriptor_sets[1], .dst_binding = 5, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_inds_final), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
             .{ .dst_set = self.descriptor_sets[1], .dst_binding = 6, .descriptor_count = 1, .descriptor_type = .storage_buffer, .p_buffer_info = @ptrCast(&b_hist), .dst_array_element = 0, .p_image_info = undefined, .p_texel_buffer_view = undefined },
         };
 
@@ -222,6 +311,8 @@ pub const SortPipeline = struct {
         self.ctx.vkd.destroyPipeline(self.ctx.device, self.count_pipeline, null);
         self.ctx.vkd.destroyPipeline(self.ctx.device, self.scan_pipeline, null);
         self.ctx.vkd.destroyPipeline(self.ctx.device, self.scatter_pipeline, null);
+        self.ctx.vkd.destroyPipeline(self.ctx.device, self.iota_pipeline, null);
+        if (self.magnitude_pipeline) |mp| self.ctx.vkd.destroyPipeline(self.ctx.device, mp, null);
         self.ctx.vkd.destroyPipelineLayout(self.ctx.device, self.pipeline_layout, null);
         self.ctx.vkd.destroyDescriptorSetLayout(self.ctx.device, self.descriptor_set_layout, null);
         self.* = undefined;
@@ -259,13 +350,15 @@ pub const SortPipeline = struct {
     // Legacy Dispatch (Local Sort)
 
     
-    // Global Radix Dispatch
+    // Global Radix Dispatch with pre-computed sort keys
     pub fn dispatchRadix(
         self: *const Self,
         keys_in: vk.Buffer,
         vals_in: vk.Buffer,
-        inds_final: vk.Buffer, // Output (ping-pong)
-        inds_temp: vk.Buffer,  // Temp (ping-pong)
+        inds_final: vk.Buffer,       // Output (ping-pong)
+        inds_temp: vk.Buffer,        // Temp (ping-pong)
+        sort_keys_final: vk.Buffer,  // Sort keys (ping-pong)
+        sort_keys_temp: vk.Buffer,   // Sort keys temp (ping-pong)
         histograms: vk.Buffer,
         num_elements: u32,
         d_model: u32,
@@ -274,9 +367,9 @@ pub const SortPipeline = struct {
         segment_size: u32,
     ) !void {
         const workgroups = (num_elements + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
-        
-        // Setup Descriptors (Ping Pong)
-        self.updateDescriptorsRadix(keys_in, vals_in, inds_final, inds_temp, histograms, vk.WHOLE_SIZE);
+
+        // Setup Descriptors (Ping Pong) with sort_keys buffers
+        self.updateDescriptorsRadix(keys_in, vals_in, inds_final, inds_temp, sort_keys_final, sort_keys_temp, histograms, vk.WHOLE_SIZE);
 
         var set_idx: u32 = 0; // 0 means Input=Final, Output=Temp. Start with Final having Iota.
 

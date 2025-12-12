@@ -102,6 +102,24 @@ pub fn build(b: *std.Build) void {
     const iota_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
     const iota_spv = iota_compile.addOutputFileArg("iota.spv");
     iota_compile.addFileArg(b.path("shaders/iota.comp"));
+
+    const magnitude_sort_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
+    const magnitude_sort_spv = magnitude_sort_compile.addOutputFileArg("magnitude_sort.spv");
+    magnitude_sort_compile.addFileArg(b.path("shaders/magnitude_sort.comp"));
+
+    // --- Optimized FP32 Fast Shader (vectorized, block skipping) ---
+    const attention_f32_fast_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
+    const attention_f32_fast_spv = attention_f32_fast_compile.addOutputFileArg("attention_f32_fast.spv");
+    attention_f32_fast_compile.addFileArg(b.path("shaders/attention_f32_fast.comp"));
+
+    // --- FP16 Shaders (require GL_EXT_shader_explicit_arithmetic_types_float16) ---
+    const attention_f16_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
+    const attention_f16_spv = attention_f16_compile.addOutputFileArg("attention_f16.spv");
+    attention_f16_compile.addFileArg(b.path("shaders/attention_f16.comp"));
+
+    const attention_f16_amd_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
+    const attention_f16_amd_spv = attention_f16_amd_compile.addOutputFileArg("attention_f16_amd.spv");
+    attention_f16_amd_compile.addFileArg(b.path("shaders/attention_f16_amd.comp"));
     // --------------------------
 
     // Main library (shared)
@@ -125,6 +143,14 @@ pub fn build(b: *std.Build) void {
     lib.root_module.addAnonymousImport("radix_scan_spv", .{ .root_source_file = radix_scan_spv });
     lib.root_module.addAnonymousImport("radix_scatter_spv", .{ .root_source_file = radix_scatter_spv });
     lib.root_module.addAnonymousImport("iota_spv", .{ .root_source_file = iota_spv });
+    lib.root_module.addAnonymousImport("magnitude_sort_spv", .{ .root_source_file = magnitude_sort_spv });
+
+    // Optimized FP32 fast shader
+    lib.root_module.addAnonymousImport("attention_f32_fast_spv", .{ .root_source_file = attention_f32_fast_spv });
+
+    // FP16 shader imports
+    lib.root_module.addAnonymousImport("attention_f16_spv", .{ .root_source_file = attention_f16_spv });
+    lib.root_module.addAnonymousImport("attention_f16_amd_spv", .{ .root_source_file = attention_f16_amd_spv });
 
     // Link Vulkan on native builds only - cross-compilation uses runtime dynamic loading
     const is_native = target.query.isNative();
@@ -156,6 +182,15 @@ pub fn build(b: *std.Build) void {
     static_lib.root_module.addAnonymousImport("radix_scan_spv", .{ .root_source_file = radix_scan_spv });
     static_lib.root_module.addAnonymousImport("radix_scatter_spv", .{ .root_source_file = radix_scatter_spv });
     static_lib.root_module.addAnonymousImport("iota_spv", .{ .root_source_file = iota_spv });
+    static_lib.root_module.addAnonymousImport("magnitude_sort_spv", .{ .root_source_file = magnitude_sort_spv });
+
+    // Optimized FP32 fast shader (static)
+    static_lib.root_module.addAnonymousImport("attention_f32_fast_spv", .{ .root_source_file = attention_f32_fast_spv });
+
+    // FP16 shader imports (static)
+    static_lib.root_module.addAnonymousImport("attention_f16_spv", .{ .root_source_file = attention_f16_spv });
+    static_lib.root_module.addAnonymousImport("attention_f16_amd_spv", .{ .root_source_file = attention_f16_amd_spv });
+
     static_lib.linkSystemLibrary("vulkan");
     static_lib.linkLibC();
 

@@ -1,0 +1,112 @@
+#version 450
+
+// Spatial Sort Shader
+// Goal: Reorder Key/Value vectors based on their "position" in embedding space
+// to maximize cache locality for "Gravity" interactions.
+
+layout(local_size_x = 256) in;
+
+// Push Constants
+layout(push_constant) uniform SortConstants {
+    uint num_elements;    // Total number of tokens (batch * seq_len)
+    uint d_model;         // Embedding dimension (head_dim * num_heads)
+    uint sort_dim;        // Dimension to sort by (simple projection axis)
+} params;
+
+// Input: Keys [N, D]
+layout(std430, binding = 0) readonly buffer InputKeys {
+    float keys[];
+};
+
+// Input: Values [N, D]
+// We must move values along with keys to keep them aligned
+layout(std430, binding = 1) readonly buffer InputValues {
+    float values[];
+};
+
+// Output: Sorted Indices [N]
+// We produce an index buffer that points to the data in sorted order.
+// This allows indirect access without physically moving massive tensors immediately.
+layout(std430, binding = 2) writeonly buffer OutputIndices {
+    uint indices[];
+};
+
+// Internal structure for sorting
+struct SortPair {
+    float key;
+    uint index;
+};
+
+// Shared memory for local sort
+shared SortPair local_data[256];
+
+void main() {
+    uint gID = gl_GlobalInvocationID.x;
+    uint lID = gl_LocalInvocationID.x;
+    
+    // Bounds check
+    if (gID >= params.num_elements) {
+        // Fill shared memory with "infinity" to push out of way
+        local_data[lID].key = 3.402823e38; // FLT_MAX
+        local_data[lID].index = 0xFFFFFFFF;
+    } else {
+        // 1. Calculate Spatial Metric (the "Key" for sorting)
+        // For N-Body, usually we project to a 1D curve (Hilbert/Morton)
+        // But for high-dim embeddings, a PCA-like projection or
+        // simple magnitude sort often works surprisingly well as a heuristic.
+        
+        // Simple Heuristic: Magnitude + Projection on axis 'sort_dim'
+        // This groups "large" vectors and "small" vectors, and vectors pointing
+        // in similar directions.
+        
+        uint offset = gID * params.d_model;
+        float proj = keys[offset + params.sort_dim % params.d_model];
+        float mag = 0.0;
+        
+        // Small subset magnitude to save bandwidth
+        for(uint i=0; i<min(8, int(params.d_model)); i++) {
+            float v = keys[offset + i];
+            mag += v*v;
+        }
+        
+        // Combine: Sort primarily by projection, locally by magnitude
+        local_data[lID].key = proj; 
+        local_data[lID].index = gID;
+    }
+    
+    groupMemoryBarrier();
+    barrier();
+    
+    // 2. Local Bitonic Sort (Bitonic Merge Sort within workgroup)
+    // This sorts chunks of 256 items.
+    // Full global sort requires multiple passes or a more complex algorithm (Radix).
+    // For "Physics Attention", even local clustering (Wave-level) helps cache.
+    
+    for (uint k = 2; k <= 256; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            uint ixj = lID ^ j;
+            if (ixj > lID) {
+                if ((lID & k) == 0) {
+                    if (local_data[lID].key > local_data[ixj].key) {
+                        SortPair tmp = local_data[lID];
+                        local_data[lID] = local_data[ixj];
+                        local_data[ixj] = tmp;
+                    }
+                } else {
+                    if (local_data[lID].key < local_data[ixj].key) {
+                        SortPair tmp = local_data[lID];
+                        local_data[lID] = local_data[ixj];
+                        local_data[ixj] = tmp;
+                    }
+                }
+            }
+            groupMemoryBarrier();
+            barrier();
+        }
+    }
+    
+    // 3. Write Output
+    if (gID < params.num_elements) {
+        indices[gID] = local_data[lID].index;
+    }
+}

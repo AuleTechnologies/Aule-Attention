@@ -18,6 +18,7 @@ pub const GravityPushConstants = extern struct {
     num_kv_heads: u32,
     key_seq_len: u32,
     max_attend: u32,
+    window_size: i32, // Sliding window size (-1 for full attention)
 };
 
 pub const GravityPipeline = struct {
@@ -333,6 +334,7 @@ pub const GravityPipeline = struct {
         causal: bool,
         has_rope: bool,
         max_attend: u32,
+        window_size: i32,
     ) !void {
         const push_constants = GravityPushConstants{
             .batch_size = batch_size,
@@ -345,6 +347,7 @@ pub const GravityPipeline = struct {
             .causal = if (causal) 1 else 0,
             .has_rope = if (has_rope) 1 else 0,
             .max_attend = max_attend,
+            .window_size = window_size,
         };
 
         const num_row_blocks = (seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;

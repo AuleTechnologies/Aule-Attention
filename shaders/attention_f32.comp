@@ -41,6 +41,7 @@ layout(push_constant) uniform PushConstants {
     uint has_rope;      // 1 to apply RoPE
     uint num_kv_heads;  // New: Number of K/V heads
     uint key_seq_len;   // New: Sequence length for K/V
+    int window_size;    // Sliding window size (-1 for full attention)
 } params;
 
 // Shared memory for tiles
@@ -163,7 +164,26 @@ void main() {
         // Masks
         uint global_col = kv_start + local_col;
         bool is_masked = !is_active || global_col >= params.key_seq_len;
+
+        // Causal masking: can't attend to future positions
         if (params.causal != 0u && global_col > global_row) is_masked = true;
+
+        // Sliding window masking: can only attend within window_size positions
+        // window_size == -1 means full attention (no window)
+        if (params.window_size > 0) {
+            // For causal: only look back window_size positions
+            // For bidirectional: look window_size/2 in each direction
+            if (params.causal != 0u) {
+                // Causal sliding window: [global_row - window_size + 1, global_row]
+                if (int(global_row) - int(global_col) >= params.window_size) is_masked = true;
+            } else {
+                // Bidirectional sliding window: centered around current position
+                int half_window = params.window_size / 2;
+                int distance = abs(int(global_row) - int(global_col));
+                if (distance > half_window) is_masked = true;
+            }
+        }
+
         if (is_masked) score = -1e30;
 
         s_S[local_row][local_col] = score;

@@ -59,7 +59,7 @@ pub const AttentionContext = struct {
 
     /// Initialize with automatic backend selection
     pub fn init(allocator: std.mem.Allocator, generic_shader: []const u8, amd_shader: []const u8) BackendError!Self {
-        return initWithBackward(allocator, generic_shader, amd_shader, null, null, null, null);
+        return initWithBackward(allocator, generic_shader, amd_shader, null, null, null, null, null, null, null, null, null, null, null, null);
     }
 
     /// Initialize with backward pass support
@@ -75,6 +75,10 @@ pub const AttentionContext = struct {
         radix_scan_shader: ?[]const u8,
         radix_scatter_shader: ?[]const u8,
         iota_shader: ?[]const u8,
+        magnitude_shader: ?[]const u8,
+        fast_shader: ?[]const u8,
+        fp16_shader: ?[]const u8,
+        fp16_amd_shader: ?[]const u8,
     ) BackendError!Self {
         // Check for forced backend via environment
         const forced_backend = std.process.getEnvVarOwned(allocator, "AULE_BACKEND") catch |err| switch (err) {
@@ -87,7 +91,7 @@ pub const AttentionContext = struct {
             if (std.mem.eql(u8, backend_name, "hip")) {
                 return initHip(allocator);
             } else if (std.mem.eql(u8, backend_name, "vulkan")) {
-                return initVulkan(allocator, generic_shader, amd_shader, forward_lse_shader, backward_shader, sort_shader, gravity_shader, radix_count_shader, radix_scan_shader, radix_scatter_shader, iota_shader);
+                return initVulkan(allocator, generic_shader, amd_shader, forward_lse_shader, backward_shader, sort_shader, gravity_shader, radix_count_shader, radix_scan_shader, radix_scatter_shader, iota_shader, magnitude_shader, fast_shader, fp16_shader, fp16_amd_shader);
             } else if (std.mem.eql(u8, backend_name, "cpu")) {
                 return initCpu(allocator);
             }
@@ -102,7 +106,7 @@ pub const AttentionContext = struct {
             return ctx;
         } else |_| {}
 
-        if (initVulkan(allocator, generic_shader, amd_shader, forward_lse_shader, backward_shader, sort_shader, gravity_shader, radix_count_shader, radix_scan_shader, radix_scatter_shader, iota_shader)) |ctx| {
+        if (initVulkan(allocator, generic_shader, amd_shader, forward_lse_shader, backward_shader, sort_shader, gravity_shader, radix_count_shader, radix_scan_shader, radix_scatter_shader, iota_shader, magnitude_shader, fast_shader, fp16_shader, fp16_amd_shader)) |ctx| {
             return ctx;
         } else |_| {}
 
@@ -121,9 +125,13 @@ pub const AttentionContext = struct {
         radix_scan_shader: ?[]const u8,
         radix_scatter_shader: ?[]const u8,
         iota_shader: ?[]const u8,
+        magnitude_shader: ?[]const u8,
+        fast_shader: ?[]const u8,
+        fp16_shader: ?[]const u8,
+        fp16_amd_shader: ?[]const u8,
     ) BackendError!Self {
         const engine = allocator.create(AttentionEngine) catch return BackendError.OutOfMemory;
-        engine.* = AttentionEngine.initWithBackward(allocator, generic_shader, amd_shader, forward_lse_shader, backward_shader, sort_shader, gravity_shader, radix_count_shader, radix_scan_shader, radix_scatter_shader, iota_shader) catch |err| {
+        engine.* = AttentionEngine.initWithBackward(allocator, generic_shader, amd_shader, forward_lse_shader, backward_shader, sort_shader, gravity_shader, radix_count_shader, radix_scan_shader, radix_scatter_shader, iota_shader, magnitude_shader, fast_shader, fp16_shader, fp16_amd_shader) catch |err| {
             allocator.destroy(engine);
             return switch (err) {
                 error.OutOfMemory => BackendError.OutOfMemory,
@@ -302,6 +310,7 @@ pub const AttentionContext = struct {
     }
 
     /// Compute attention: output = softmax(Q @ K^T / sqrt(d)) @ V
+    /// window_size: sliding window size (-1 for full attention)
     pub fn attention(
         self: *Self,
         Q: *Tensor,
@@ -311,17 +320,18 @@ pub const AttentionContext = struct {
         rot_cos: ?*Tensor,
         rot_sin: ?*Tensor,
         causal: bool,
+        window_size: i32,
     ) BackendError!void {
         switch (self.backend) {
             .vulkan => {
                 const ctx = self.vulkan_ctx orelse return BackendError.BackendInitFailed;
-                
+
                 // Extract Vulkan handles for RoPE if present
                 var rot_cos_vk: ?*const GpuTensor = null;
                 if (rot_cos) |t| {
                     if (t.backend == .vulkan) rot_cos_vk = t.handle.vulkan;
                 }
-                
+
                 var rot_sin_vk: ?*const GpuTensor = null;
                 if (rot_sin) |t| {
                     if (t.backend == .vulkan) rot_sin_vk = t.handle.vulkan;
@@ -334,7 +344,8 @@ pub const AttentionContext = struct {
                     output.handle.vulkan,
                     rot_cos_vk,
                     rot_sin_vk,
-                    causal
+                    causal,
+                    window_size,
                 ) catch |err| switch (err) {
                     error.InvalidShape, error.ShapeMismatch => return BackendError.ShapeMismatch,
                     else => return BackendError.ComputeFailed,
@@ -381,6 +392,7 @@ pub const AttentionContext = struct {
     }
 
     /// Gravity Attention: Indirect attention using sorted indices
+    /// window_size: sliding window size (-1 for full attention)
     pub fn forwardGravity(
         self: *Self,
         Q: *Tensor,
@@ -392,17 +404,18 @@ pub const AttentionContext = struct {
         indices: *Tensor,
         causal: bool,
         max_attend: u32,
+        window_size: i32,
     ) BackendError!void {
         switch (self.backend) {
             .vulkan => {
                 const ctx = self.vulkan_ctx orelse return BackendError.BackendInitFailed;
-                
+
                 // Extract Vulkan handles for RoPE if present
                 var rot_cos_vk: ?*const GpuTensor = null;
                 if (rot_cos) |t| {
                     if (t.backend == .vulkan) rot_cos_vk = t.handle.vulkan;
                 }
-                
+
                 var rot_sin_vk: ?*const GpuTensor = null;
                 if (rot_sin) |t| {
                     if (t.backend == .vulkan) rot_sin_vk = t.handle.vulkan;
@@ -417,7 +430,8 @@ pub const AttentionContext = struct {
                     rot_sin_vk,
                     indices.handle.vulkan,
                     causal,
-                    max_attend
+                    max_attend,
+                    window_size,
                 ) catch |err| switch (err) {
                     error.InvalidShape, error.ShapeMismatch => return BackendError.ShapeMismatch,
                     else => return BackendError.ComputeFailed,

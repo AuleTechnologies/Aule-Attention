@@ -17,6 +17,7 @@ pub const AttentionPushConstants = extern struct {
     has_rope: u32, // 1 to apply RoPE, 0 to skip
     num_kv_heads: u32, // Number of K/V heads
     key_seq_len: u32, // Sequence length of K/V
+    window_size: i32, // Sliding window size (-1 for full attention)
 };
 
 pub const AttentionPipeline = struct {
@@ -318,6 +319,7 @@ pub const AttentionPipeline = struct {
         head_dim: u32,
         causal: bool,
         has_rope: bool,
+        window_size: i32,
     ) !void {
         const push_constants = AttentionPushConstants{
             .batch_size = batch_size,
@@ -329,6 +331,7 @@ pub const AttentionPipeline = struct {
             .has_rope = if (has_rope) 1 else 0,
             .num_kv_heads = num_kv_heads,
             .key_seq_len = key_seq_len,
+            .window_size = window_size,
         };
 
         // Workgroup dimensions

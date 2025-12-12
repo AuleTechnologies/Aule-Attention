@@ -254,6 +254,17 @@ class Aule:
         self._lib.aule_tensor_destroy.argtypes = [ctypes.c_uint64]
         self._lib.aule_tensor_destroy.restype = None
 
+        # Tensor pool management
+        try:
+            self._lib.aule_tensor_count.argtypes = []
+            self._lib.aule_tensor_count.restype = ctypes.c_uint32
+            self._lib.aule_tensor_max.argtypes = []
+            self._lib.aule_tensor_max.restype = ctypes.c_uint32
+            self._lib.aule_tensor_clear_all.argtypes = []
+            self._lib.aule_tensor_clear_all.restype = None
+        except AttributeError:
+            pass
+
         self._lib.aule_tensor_upload.argtypes = [
             ctypes.c_uint64, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32
         ]
@@ -277,6 +288,7 @@ class Aule:
             ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64,
             ctypes.c_uint64, ctypes.c_uint64,  # rot_cos, rot_sin
             ctypes.c_int32,  # causal
+            ctypes.c_int32,  # window_size (-1 for full attention)
         ]
         self._lib.aule_attention_forward_gpu.restype = ctypes.c_int32
 
@@ -294,7 +306,8 @@ class Aule:
             ctypes.c_uint64, # Sin
             ctypes.c_uint64, # Indices
             ctypes.c_int32,  # Causal
-            ctypes.c_uint32  # Max Attend (Top-k)
+            ctypes.c_uint32, # Max Attend (Top-k)
+            ctypes.c_int32,  # window_size (-1 for full attention)
         ]
         self._lib.aule_attention_forward_gravity.restype = ctypes.c_int32
 
@@ -324,6 +337,29 @@ class Aule:
         try:
             self._lib.aule_get_subgroup_size.argtypes = []
             self._lib.aule_get_subgroup_size.restype = ctypes.c_uint32
+        except AttributeError:
+            pass
+
+        try:
+            self._lib.aule_get_device_name.argtypes = [ctypes.c_char_p, ctypes.c_uint32]
+            self._lib.aule_get_device_name.restype = ctypes.c_int32
+        except AttributeError:
+            pass
+
+        try:
+            self._lib.aule_get_gpu_vendor.argtypes = []
+            self._lib.aule_get_gpu_vendor.restype = ctypes.c_int32
+        except AttributeError:
+            pass
+
+        # Shader variant selection API
+        try:
+            self._lib.aule_set_shader_variant.argtypes = [ctypes.c_uint8]
+            self._lib.aule_set_shader_variant.restype = ctypes.c_int32
+            self._lib.aule_get_shader_variant.argtypes = []
+            self._lib.aule_get_shader_variant.restype = ctypes.c_int32
+            self._lib.aule_has_shader_variant.argtypes = [ctypes.c_uint8]
+            self._lib.aule_has_shader_variant.restype = ctypes.c_int32
         except AttributeError:
             pass
 
@@ -371,8 +407,11 @@ class Aule:
         if not self._initialized:
             return "Not initialized"
         try:
-            name = self._lib.aule_get_device_name()
-            return name.decode() if name else "Unknown"
+            buffer = ctypes.create_string_buffer(256)
+            result = self._lib.aule_get_device_name(buffer, 256)
+            if result >= 0:
+                return buffer.value.decode('utf-8', errors='replace')
+            return "Unknown"
         except AttributeError:
             return "Unknown"
 
@@ -381,9 +420,12 @@ class Aule:
         """Get the GPU vendor (amd, nvidia, intel, apple, other)."""
         if not self._initialized:
             return "unknown"
-        vendor_id = self._lib.aule_get_vendor()
-        vendors = {0: "other", 1: "amd", 2: "nvidia", 3: "intel", 4: "apple"}
-        return vendors.get(vendor_id, "unknown")
+        try:
+            vendor_id = self._lib.aule_get_gpu_vendor()
+            vendors = {0: "other", 1: "amd", 2: "nvidia", 3: "intel", 4: "apple"}
+            return vendors.get(vendor_id, "unknown")
+        except AttributeError:
+            return "unknown"
 
     @property
     def is_amd_optimized(self) -> bool:
@@ -423,7 +465,104 @@ class Aule:
             "amd_optimized": self.is_amd_optimized,
             "fp16_supported": self.fp16_supported,
             "subgroup_size": self.subgroup_size,
+            "shader_variant": self.shader_variant,
+            "available_variants": self.available_shader_variants,
         }
+
+    # Shader variant names
+    SHADER_BASELINE = 0  # Original 16x16 block, scalar loads
+    SHADER_FAST = 1      # Optimized 32x32 block, vec4 loads, block skipping
+    SHADER_FP16 = 2      # FP16 with FP32 accumulation
+    SHADER_FP16_AMD = 3  # FP16 optimized for AMD 64-wide wavefronts
+
+    @property
+    def shader_variant(self) -> int:
+        """Get the current shader variant. Returns -1 if not supported."""
+        if not self._initialized:
+            return -1
+        try:
+            return self._lib.aule_get_shader_variant()
+        except AttributeError:
+            return -1
+
+    @property
+    def shader_variant_name(self) -> str:
+        """Get the name of the current shader variant."""
+        variant = self.shader_variant
+        names = {0: "baseline", 1: "fast", 2: "fp16", 3: "fp16_amd"}
+        return names.get(variant, "unknown")
+
+    @property
+    def available_shader_variants(self) -> list:
+        """Get list of available shader variants."""
+        if not self._initialized:
+            return []
+        variants = []
+        try:
+            for v in [0, 1, 2, 3]:
+                if self._lib.aule_has_shader_variant(v) == 1:
+                    variants.append(v)
+        except AttributeError:
+            variants = [0]  # Baseline always available
+        return variants
+
+    def set_shader_variant(self, variant: int) -> None:
+        """
+        Set the shader variant for attention computation.
+
+        Args:
+            variant: Shader variant ID (0=baseline, 1=fast, 2=fp16, 3=fp16_amd)
+                     Use Aule.SHADER_BASELINE, Aule.SHADER_FAST, etc.
+
+        Raises:
+            AuleError: If variant is not available
+        """
+        if not self._initialized:
+            raise AuleError("Aule not initialized")
+        try:
+            result = self._lib.aule_set_shader_variant(ctypes.c_uint8(variant))
+            if result == -1:
+                raise AuleError("Aule not initialized")
+            elif result == -2:
+                names = {0: "baseline", 1: "fast", 2: "fp16", 3: "fp16_amd"}
+                raise AuleError(f"Shader variant '{names.get(variant, variant)}' not available")
+        except AttributeError:
+            raise AuleError("Shader variant selection not supported in this version")
+
+    def has_shader_variant(self, variant: int) -> bool:
+        """Check if a shader variant is available."""
+        if not self._initialized:
+            return False
+        try:
+            return self._lib.aule_has_shader_variant(ctypes.c_uint8(variant)) == 1
+        except AttributeError:
+            return variant == 0  # Baseline always available
+
+    @property
+    def tensor_count(self) -> int:
+        """Get number of active GPU tensors."""
+        try:
+            return self._lib.aule_tensor_count()
+        except AttributeError:
+            return len(self._tensors)
+
+    @property
+    def tensor_max(self) -> int:
+        """Get maximum number of tensors allowed."""
+        try:
+            return self._lib.aule_tensor_max()
+        except AttributeError:
+            return 1024  # Default
+
+    def clear_tensors(self) -> None:
+        """Clear all GPU tensors to free memory. Use when hitting tensor limits."""
+        try:
+            self._lib.aule_tensor_clear_all()
+        except AttributeError:
+            pass
+        # Also clear Python-side tracking
+        self._tensors.clear()
+        self._tensor_cache.clear()
 
     def tensor(self, shape: Tuple[int, int, int, int], dtype: np.dtype = np.float32) -> GpuTensor:
         """
@@ -476,6 +615,7 @@ class Aule:
         rot_cos: Optional[GpuTensor] = None,
         rot_sin: Optional[GpuTensor] = None,
         causal: bool = False,
+        window_size: int = -1,
     ) -> None:
         """
         Compute attention on GPU tensors - NO CPU<->GPU COPY.
@@ -491,6 +631,7 @@ class Aule:
             rot_cos: Optional Rotary Embedding Cosine tensor [1, 1, seq_len, head_dim/2] or similar broadcastable
             rot_sin: Optional Rotary Embedding Sine tensor
             causal: If True, apply causal masking (for autoregressive models like LLMs)
+            window_size: Sliding window size (-1 for full attention)
         """
         if not self._initialized:
             raise AuleError("Aule not initialized")
@@ -506,6 +647,7 @@ class Aule:
             ctypes.c_uint64(rot_cos_handle),
             ctypes.c_uint64(rot_sin_handle),
             ctypes.c_int32(1 if causal else 0),
+            ctypes.c_int32(window_size),
         )
 
         if result != 0:
@@ -520,6 +662,7 @@ class Aule:
         rot_cos: Optional[np.ndarray] = None,
         rot_sin: Optional[np.ndarray] = None,
         causal: bool = False,
+        window_size: int = -1,
     ) -> np.ndarray:
         """
         Compute scaled dot-product attention (simple API, copies data).
@@ -531,6 +674,7 @@ class Aule:
             key: Key tensor of shape [batch_size, num_heads, seq_len, head_dim]
             value: Value tensor of shape [batch_size, num_heads, seq_len, head_dim]
             causal: If True, apply causal masking (for autoregressive models like LLMs)
+            window_size: Sliding window size (-1 for full attention)
 
         Returns:
             Output tensor of shape [batch_size, num_heads, seq_len, head_dim]
@@ -626,7 +770,7 @@ class Aule:
             sin_gpu.upload(rot_sin)
             
             # This calls the fast path
-            self.attention_gpu(q_gpu, k_gpu, v_gpu, out_gpu, cos_gpu, sin_gpu, causal)
+            self.attention_gpu(q_gpu, k_gpu, v_gpu, out_gpu, cos_gpu, sin_gpu, causal, window_size)
             
             # Download result directly into output buffer if possible?
             # download() returns new array.
@@ -664,7 +808,7 @@ class Aule:
         v_gpu.upload(value)
 
         # Compute on GPU
-        self.attention_gpu(q_gpu, k_gpu, v_gpu, out_gpu, causal=causal)
+        self.attention_gpu(q_gpu, k_gpu, v_gpu, out_gpu, causal=causal, window_size=window_size)
 
         # Download result
         return out_gpu.download()
@@ -884,12 +1028,13 @@ class Aule:
         rot_cos: Optional[np.ndarray] = None,
         rot_sin: Optional[np.ndarray] = None,
         causal: bool = False,
-        max_attend: Optional[int] = None
+        max_attend: Optional[int] = None,
+        window_size: int = -1,
     ) -> np.ndarray:
         """
         Compute attention using indirect lookup via spatial sort indices.
         PROTOTYPE PHASE 3: Validates that we can correctly read K/V via indices.
-        
+
         Args:
             query: Query tensor [batch, heads, seq, dim]
             key: Key tensor [batch, heads, seq, dim]
@@ -899,7 +1044,8 @@ class Aule:
             rot_sin: Optional Rotary Embedding Sine tensor
             causal: If True, apply causal masking
             max_attend: Top-K keys to attend to. If None, attends to all.
-        
+            window_size: Sliding window size (-1 for full attention)
+
         Returns:
             Output tensor of shape [batch_size, num_heads, seq_len, head_dim]
         """
@@ -982,7 +1128,8 @@ class Aule:
             ctypes.c_uint64(rot_sin_handle),
             ctypes.c_uint64(indices_gpu.handle),
             ctypes.c_int32(1 if causal else 0),
-            ctypes.c_uint32(max_attend)
+            ctypes.c_uint32(max_attend),
+            ctypes.c_int32(window_size),
         )
         
         if ret != 0:
@@ -1024,6 +1171,7 @@ def attention(
     key: np.ndarray,
     value: np.ndarray,
     causal: bool = False,
+    window_size: int = -1,
 ) -> np.ndarray:
     """
     Convenience function for one-off attention computations.
@@ -1035,6 +1183,7 @@ def attention(
         key: Key tensor of shape [batch_size, num_heads, seq_len, head_dim]
         value: Value tensor of shape [batch_size, num_heads, seq_len, head_dim]
         causal: If True, apply causal masking (for autoregressive models like LLMs)
+        window_size: Sliding window size (-1 for full attention)
 
     Returns:
         Output tensor of shape [batch_size, num_heads, seq_len, head_dim]
@@ -1044,7 +1193,7 @@ def attention(
     if _AULE_INSTANCE_SINGLETON is None:
         _AULE_INSTANCE_SINGLETON = Aule()
 
-    return _AULE_INSTANCE_SINGLETON.attention(query, key, value, causal=causal)
+    return _AULE_INSTANCE_SINGLETON.attention(query, key, value, causal=causal, window_size=window_size)
 
 
 def flash_attention(
@@ -1054,6 +1203,7 @@ def flash_attention(
     rot_cos: Optional[np.ndarray] = None,
     rot_sin: Optional[np.ndarray] = None,
     causal: bool = True,
+    window_size: int = -1,
 ) -> np.ndarray:
     """
     FlashAttention-style scaled dot-product attention.
@@ -1065,6 +1215,7 @@ def flash_attention(
         key: Key tensor of shape [batch_size, num_heads, seq_len, head_dim]
         value: Value tensor of shape [batch_size, num_heads, seq_len, head_dim]
         causal: If True (default), apply causal masking for autoregressive models
+        window_size: Sliding window size (-1 for full attention)
 
     Returns:
         Output tensor of shape [batch_size, num_heads, seq_len, head_dim]
@@ -1074,7 +1225,7 @@ def flash_attention(
     if _AULE_INSTANCE_SINGLETON is None:
         _AULE_INSTANCE_SINGLETON = Aule()
 
-    return _AULE_INSTANCE_SINGLETON.attention(query, key, value, causal=causal)
+    return _AULE_INSTANCE_SINGLETON.attention(query, key, value, rot_cos=rot_cos, rot_sin=rot_sin, causal=causal, window_size=window_size)
 
 
 def supports_backward() -> bool:

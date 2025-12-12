@@ -1,43 +1,22 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
-// FlashAttention-2 Forward Pass - FP16 Compute with FP32 I/O
-//
+// FlashAttention-2 Forward Pass - Optimized FP32 Version
 // Key optimizations:
-//   1. FP32 input/output for compatibility
-//   2. FP16 compute for speed on supported GPUs
-//   3. FP32 accumulation for numerical stability
-//   4. Larger block size (32x32 = 1024 threads)
-//   5. Sliding window block skipping
-//   6. Bank conflict avoidance via padding
-//   7. GQA support for multi-query attention
+//   1. Larger block size (Br=32, Bc=32) for better occupancy
+//   2. Vectorized vec4 loads for 4x memory throughput
+//   3. Sliding window block skipping (compute savings)
+//   4. Reduced barrier() calls
+//   5. Better memory access patterns
 
 layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
 
-// FP32 I/O buffers (compatible with existing API)
-layout(std430, set = 0, binding = 0) readonly buffer QueryBuffer {
-    vec4 data[];
-} Q;
-
-layout(std430, set = 0, binding = 1) readonly buffer KeyBuffer {
-    vec4 data[];
-} K;
-
-layout(std430, set = 0, binding = 2) readonly buffer ValueBuffer {
-    vec4 data[];
-} V;
-
-layout(std430, set = 0, binding = 3) writeonly buffer OutputBuffer {
-    vec4 data[];
-} O;
-
-layout(std430, set = 0, binding = 4) readonly buffer RotaryCosBuffer {
-    float data[];
-} RotCos;
-
-layout(std430, set = 0, binding = 5) readonly buffer RotarySinBuffer {
-    float data[];
-} RotSin;
+// Storage buffers
+layout(std430, set = 0, binding = 0) readonly buffer QBuffer { vec4 data[]; } Q;
+layout(std430, set = 0, binding = 1) readonly buffer KBuffer { vec4 data[]; } K;
+layout(std430, set = 0, binding = 2) readonly buffer VBuffer { vec4 data[]; } V;
+layout(std430, set = 0, binding = 3) writeonly buffer OutputBuffer { vec4 data[]; } O;
+layout(std430, set = 0, binding = 4) readonly buffer RotaryCosBuffer { float data[]; } RotCos;
+layout(std430, set = 0, binding = 5) readonly buffer RotarySinBuffer { float data[]; } RotSin;
 
 layout(push_constant) uniform PushConstants {
     uint batch_size;
@@ -55,22 +34,23 @@ layout(push_constant) uniform PushConstants {
 const uint BLOCK_SIZE = 32;
 const uint HEAD_DIM_VEC4 = 16;  // 64 / 4 = 16 vec4s
 
-// Shared memory with +1 padding to avoid bank conflicts
-// Use FP16 for shared memory to reduce pressure
-shared f16vec4 s_Q[BLOCK_SIZE][HEAD_DIM_VEC4 + 1];
-shared f16vec4 s_K[BLOCK_SIZE][HEAD_DIM_VEC4 + 1];
-shared f16vec4 s_V[BLOCK_SIZE][HEAD_DIM_VEC4 + 1];
-shared float s_S[BLOCK_SIZE][BLOCK_SIZE + 1];
+// Shared memory with padding to reduce bank conflicts
+// Using [33] stride instead of [32] avoids 32-way bank conflicts on AMD
+shared vec4 s_Q[BLOCK_SIZE][HEAD_DIM_VEC4 + 1];
+shared vec4 s_K[BLOCK_SIZE][HEAD_DIM_VEC4 + 1];
+shared vec4 s_V[BLOCK_SIZE][HEAD_DIM_VEC4 + 1];
+shared float s_S[BLOCK_SIZE][BLOCK_SIZE + 1];  // Scores with padding
 
 void main() {
     uint local_row = gl_LocalInvocationID.y;
     uint local_col = gl_LocalInvocationID.x;
+    uint thread_id = local_row * BLOCK_SIZE + local_col;
 
     uint batch_head_idx = gl_WorkGroupID.z;
     uint batch_idx = batch_head_idx / params.num_heads;
     uint head_idx = batch_head_idx % params.num_heads;
 
-    // GQA: map Q heads to K/V heads
+    // GQA
     uint ratio = params.num_heads / params.num_kv_heads;
     uint kv_head_idx = head_idx / ratio;
     uint kv_batch_head_idx = batch_idx * params.num_kv_heads + kv_head_idx;
@@ -80,11 +60,12 @@ void main() {
 
     bool is_active = (batch_idx < params.batch_size) && (global_row < params.seq_len);
 
+    // Base offsets (in vec4 units)
     uint head_dim_vec4 = params.head_dim / 4;
     uint qs_off = batch_head_idx * params.seq_len * head_dim_vec4;
     uint ks_off = kv_batch_head_idx * params.key_seq_len * head_dim_vec4;
 
-    // FP32 accumulators for numerical stability
+    // Initialize accumulators (in registers)
     float row_max = -1e30;
     float row_sum = 0.0;
     vec4 output_acc[HEAD_DIM_VEC4];
@@ -93,37 +74,72 @@ void main() {
         output_acc[i] = vec4(0.0);
     }
 
-    // Load Q tile - convert FP32 to FP16
+    // Load Q tile - vectorized with optional RoPE
+    // Each thread loads multiple vec4s to fill the tile
+    uint q_row = local_row;
+    uint half_dim = params.head_dim / 2;
     for (uint v = local_col; v < head_dim_vec4; v += BLOCK_SIZE) {
         vec4 q_val = vec4(0.0);
         if (is_active && v < head_dim_vec4) {
             q_val = Q.data[qs_off + global_row * head_dim_vec4 + v];
+
+            // Apply RoPE if enabled
+            if (params.has_rope != 0u) {
+                // Each vec4 contains 4 floats: d*4, d*4+1, d*4+2, d*4+3
+                // RoPE pairs: (0,1), (2,3), (4,5), ...
+                // rot_idx for pair (2i, 2i+1) = row * (D/2) + i
+                uint base_d = v * 4;  // Starting dimension for this vec4
+
+                // Process pairs within this vec4
+                // Pair 0: (base_d, base_d+1), Pair 1: (base_d+2, base_d+3)
+                uint rot_idx_0 = global_row * half_dim + (base_d / 2);
+                uint rot_idx_1 = global_row * half_dim + (base_d / 2) + 1;
+
+                float cos0 = RotCos.data[rot_idx_0];
+                float sin0 = RotSin.data[rot_idx_0];
+                float cos1 = RotCos.data[rot_idx_1];
+                float sin1 = RotSin.data[rot_idx_1];
+
+                // Rotate pair 0: q[0], q[1]
+                float q0_rot = q_val.x * cos0 - q_val.y * sin0;
+                float q1_rot = q_val.x * sin0 + q_val.y * cos0;
+
+                // Rotate pair 1: q[2], q[3]
+                float q2_rot = q_val.z * cos1 - q_val.w * sin1;
+                float q3_rot = q_val.z * sin1 + q_val.w * cos1;
+
+                q_val = vec4(q0_rot, q1_rot, q2_rot, q3_rot);
+            }
         }
-        s_Q[local_row][v] = f16vec4(q_val);  // Convert to FP16
+        s_Q[q_row][v] = q_val;
     }
     barrier();
 
-    // Block skipping for sliding window - KEY OPTIMIZATION
+    // Calculate window bounds for block skipping
     uint num_kv_blocks = (params.key_seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
     uint first_kv_block = 0;
     uint last_kv_block = num_kv_blocks;
 
     if (params.window_size > 0) {
+        // Calculate which blocks actually need to be processed
         uint block_start_row = block_row * BLOCK_SIZE;
         uint block_end_row = min(block_start_row + BLOCK_SIZE, params.seq_len);
 
         if (params.causal != 0u) {
-            // Causal window: rows can attend to [row - window + 1, row]
+            // Causal: rows [block_start, block_end) can attend to [row - window + 1, row]
+            // First valid K position for any row in this block
             uint first_valid_k = 0;
             if (block_start_row >= uint(params.window_size)) {
                 first_valid_k = block_start_row - uint(params.window_size) + 1;
             }
+            // Last valid K position (inclusive) for any row in this block
             uint last_valid_k = block_end_row - 1;
 
             first_kv_block = first_valid_k / BLOCK_SIZE;
             last_kv_block = (last_valid_k / BLOCK_SIZE) + 1;
         } else {
-            // Bidirectional window
+            // Bidirectional: centered window
             uint half_window = uint(params.window_size) / 2;
             uint first_valid_k = 0;
             if (block_start_row > half_window) {
@@ -134,41 +150,63 @@ void main() {
             first_kv_block = first_valid_k / BLOCK_SIZE;
             last_kv_block = (last_valid_k / BLOCK_SIZE) + 1;
         }
+
         last_kv_block = min(last_kv_block, num_kv_blocks);
     }
 
-    // Process K/V blocks - WITH SKIPPING
+    // Iterate over K/V blocks - WITH SKIPPING
     for (uint kv_block = first_kv_block; kv_block < last_kv_block; kv_block++) {
         uint kv_start = kv_block * BLOCK_SIZE;
         uint kv_row = kv_start + local_row;
         bool kv_valid = kv_row < params.key_seq_len;
 
-        // Load K tile - convert FP32 to FP16
+        // Load K tile - vectorized with optional RoPE
         for (uint v = local_col; v < head_dim_vec4; v += BLOCK_SIZE) {
             vec4 k_val = vec4(0.0);
             if (kv_valid && batch_idx < params.batch_size && v < head_dim_vec4) {
                 k_val = K.data[ks_off + kv_row * head_dim_vec4 + v];
+
+                // Apply RoPE if enabled
+                if (params.has_rope != 0u) {
+                    uint base_d = v * 4;
+                    uint rot_idx_0 = kv_row * half_dim + (base_d / 2);
+                    uint rot_idx_1 = kv_row * half_dim + (base_d / 2) + 1;
+
+                    float cos0 = RotCos.data[rot_idx_0];
+                    float sin0 = RotSin.data[rot_idx_0];
+                    float cos1 = RotCos.data[rot_idx_1];
+                    float sin1 = RotSin.data[rot_idx_1];
+
+                    // Rotate pair 0
+                    float k0_rot = k_val.x * cos0 - k_val.y * sin0;
+                    float k1_rot = k_val.x * sin0 + k_val.y * cos0;
+
+                    // Rotate pair 1
+                    float k2_rot = k_val.z * cos1 - k_val.w * sin1;
+                    float k3_rot = k_val.z * sin1 + k_val.w * cos1;
+
+                    k_val = vec4(k0_rot, k1_rot, k2_rot, k3_rot);
+                }
             }
-            s_K[local_row][v] = f16vec4(k_val);  // Convert to FP16
+            s_K[local_row][v] = k_val;
         }
 
-        // Load V tile - convert FP32 to FP16
+        // Load V tile - vectorized
         for (uint v = local_col; v < head_dim_vec4; v += BLOCK_SIZE) {
             vec4 v_val = vec4(0.0);
             if (kv_valid && batch_idx < params.batch_size && v < head_dim_vec4) {
                 v_val = V.data[ks_off + kv_row * head_dim_vec4 + v];
             }
-            s_V[local_row][v] = f16vec4(v_val);  // Convert to FP16
+            s_V[local_row][v] = v_val;
         }
         barrier();
 
-        // Compute Q @ K^T in FP16, accumulate in FP32
+        // Compute Q @ K^T score for this thread's (row, col)
         float score = 0.0;
         for (uint v = 0; v < head_dim_vec4; v++) {
-            // FP16 dot product, convert to FP32 for accumulation
-            f16vec4 q = s_Q[local_row][v];
-            f16vec4 k = s_K[local_col][v];
-            score += float(dot(q, k));
+            vec4 q = s_Q[local_row][v];
+            vec4 k = s_K[local_col][v];
+            score += dot(q, k);  // vec4 dot product - 4 FMAs in one instruction
         }
         score *= params.scale;
 
@@ -176,10 +214,8 @@ void main() {
         uint global_col = kv_start + local_col;
         bool is_masked = !is_active || global_col >= params.key_seq_len;
 
-        // Causal mask
         if (params.causal != 0u && global_col > global_row) is_masked = true;
 
-        // Sliding window mask
         if (params.window_size > 0) {
             if (params.causal != 0u) {
                 if (int(global_row) - int(global_col) >= params.window_size) is_masked = true;
@@ -194,8 +230,9 @@ void main() {
         s_S[local_row][local_col] = score;
         barrier();
 
-        // Online softmax (FP32 for stability)
+        // Online Softmax - each thread handles its own row
         if (is_active) {
+            // Find block max
             float block_max = -1e30;
             for (uint c = 0; c < BLOCK_SIZE; c++) {
                 block_max = max(block_max, s_S[local_row][c]);
@@ -204,19 +241,21 @@ void main() {
             float new_max = max(row_max, block_max);
             float correction = exp(row_max - new_max);
 
+            // Rescale previous accumulator
             row_sum *= correction;
             for (uint v = 0; v < HEAD_DIM_VEC4; v++) {
                 output_acc[v] *= correction;
             }
 
+            // Accumulate this block
             float block_sum = 0.0;
             for (uint c = 0; c < BLOCK_SIZE; c++) {
                 float p = exp(s_S[local_row][c] - new_max);
                 block_sum += p;
 
+                // Accumulate weighted V
                 for (uint v = 0; v < HEAD_DIM_VEC4; v++) {
-                    // V is FP16 in shared memory, convert to FP32 for accumulation
-                    output_acc[v] += p * vec4(s_V[c][v]);
+                    output_acc[v] += p * s_V[c][v];
                 }
             }
 
@@ -226,7 +265,7 @@ void main() {
         barrier();
     }
 
-    // Write output (already FP32)
+    // Write output - vectorized
     if (is_active && batch_idx < params.batch_size) {
         float inv_sum = 1.0 / row_sum;
         for (uint v = local_col; v < head_dim_vec4; v += BLOCK_SIZE) {

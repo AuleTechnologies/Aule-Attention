@@ -27,6 +27,7 @@ layout(push_constant) uniform PushConstants {
     uint num_kv_heads;
     uint key_seq_len;
     uint max_attend;    // Top-K limit
+    int window_size;    // Sliding window size (-1 for full attention)
 } params;
 
 const uint BLOCK_SIZE = 16;
@@ -57,11 +58,10 @@ void main() {
     // Base offset for K/V - we will add indirect offset to this
     uint ks_base = kv_batch_head_idx * params.key_seq_len * params.head_dim;
     
-    // Indices are typically [Batch*Head*Seq] or just [Seq].
-    // Note: The current spatial_sort is global-ish or per tensor.
-    // If we assume the Indices buffer matches K's layout (Batch*KVHead*Seq),
-    // then we access Indices at kv_batch_head_idx * key_seq_len.
-    uint indices_base = kv_batch_head_idx * params.key_seq_len;
+    // Indices are [Batch*Head*Seq] where Head = num_heads (Q heads)
+    // Each Q head has its own sorted order of K positions to attend to
+    // So we use batch_head_idx (Q head index), not kv_batch_head_idx
+    uint indices_base = batch_head_idx * params.key_seq_len;
 
     uint block_row = gl_WorkGroupID.y;
     uint global_row = block_row * BLOCK_SIZE + local_row;
@@ -134,8 +134,21 @@ void main() {
         }
         score *= params.scale;
         
-        // Causal
+        // Causal masking
         if (params.causal != 0u && real_idx > global_row) score = -1e30;
+
+        // Sliding window masking
+        if (params.window_size > 0) {
+            if (params.causal != 0u) {
+                // Causal sliding window: can only attend to positions within window behind
+                if (int(global_row) - int(real_idx) >= params.window_size) score = -1e30;
+            } else {
+                // Bidirectional sliding window
+                int half_window = params.window_size / 2;
+                int distance = abs(int(global_row) - int(real_idx));
+                if (distance > half_window) score = -1e30;
+            }
+        }
         
         // Online softmax update
         if (is_active) {
