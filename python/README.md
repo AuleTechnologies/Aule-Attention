@@ -2,7 +2,51 @@
 
 **FlashAttention that just works. No compilation. Any GPU.**
 
-Version: 0.3.3
+Version: 0.3.5
+
+## What's New in 0.3.5
+
+- **7-13x Faster Vulkan**: New fast shader with 32x32 blocks and vec4 loads
+- **Sliding Window Attention**: Efficient local attention with `window_size` parameter
+- **Native FP16/BF16 Compute**: Triton kernels now use native precision (no FP32 conversion overhead)
+- **Multiple Shader Variants**: Choose baseline, fast, fp16, or fp16_amd for your hardware
+- **RoPE Fix**: Rotary position embeddings now work with fast shader
+- **Gravity Attention Fix**: Multi-head support fixed for indirect attention
+
+### Performance Highlights
+
+| Feature | Improvement |
+|---------|-------------|
+| Fast Shader | 7-13x speedup over baseline |
+| Sliding Window (S=1024, W=128) | 7.6x faster (544ms → 71ms) |
+| Triton FP16/BF16 | ~20-30% faster (native compute) |
+
+### New Shader Variants API
+
+```python
+from aule.vulkan import Aule
+
+with Aule() as aule:
+    # Check available variants
+    print(aule.available_shader_variants)  # [0, 1, 2, 3]
+    print(aule.shader_variant_name)  # "fast" (default)
+
+    # Switch variants
+    aule.set_shader_variant(Aule.SHADER_BASELINE)  # 0: Original 16x16
+    aule.set_shader_variant(Aule.SHADER_FAST)      # 1: Optimized 32x32 (default)
+    aule.set_shader_variant(Aule.SHADER_FP16)      # 2: FP16 with FP32 accumulation
+    aule.set_shader_variant(Aule.SHADER_FP16_AMD)  # 3: FP16 for AMD 64-wide wavefronts
+```
+
+### Sliding Window Attention
+
+```python
+# Mistral-style sliding window (only attend to nearby tokens)
+output = aule.attention_gravity(q, k, v, indices, window_size=256)
+
+# Massive speedup for long sequences
+# S=4096, window=512 → ~8x faster than full attention
+```
 
 ## What's New in 0.3.3
 
@@ -64,6 +108,7 @@ output = flash_attention(q, k, v, causal=True)
 - Training support with backward pass (Triton backend)
 - Grouped Query Attention (GQA) and Multi-Query Attention (MQA) support
 - Cross-attention with different Q/KV sequence lengths
+- Sliding window attention for efficient long sequences
 - O(N) memory complexity via FlashAttention-2 algorithm
 
 ## Backends
@@ -71,7 +116,7 @@ output = flash_attention(q, k, v, causal=True)
 | Backend | Hardware | Features |
 |---------|----------|----------|
 | Triton | AMD ROCm (Linux), NVIDIA CUDA | Training + Inference, head_dim up to 128 |
-| Vulkan | Any Vulkan 1.2+ GPU (including Windows AMD) | Inference, head_dim up to 64, GQA/MQA |
+| Vulkan | Any Vulkan 1.2+ GPU (including Windows AMD) | Inference, head_dim up to 64, GQA/MQA, Sliding Window |
 | CPU | NumPy | Fallback, any head_dim |
 
 > **Windows + AMD**: Automatically uses Vulkan backend (Triton AMD only supports Linux).
