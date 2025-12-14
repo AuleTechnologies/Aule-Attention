@@ -210,12 +210,49 @@ pub fn build(b: *std.Build) void {
     const attention_test_step = b.step("test-attention", "Run attention tests");
     attention_test_step.dependOn(&run_attention_tests.step);
 
+    // Tests - block pool
+    const block_pool_tests = b.addTest(.{
+        .root_source_file = b.path("tests/test_block_pool.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    block_pool_tests.root_module.addImport("vulkan", vulkan_mod);
+    block_pool_tests.root_module.addOptions("config", options);
+    block_pool_tests.root_module.addImport("aule", static_lib.root_module);
+
+    // Create modules with vulkan dependency
+    const block_pool_mod = b.createModule(.{ .root_source_file = b.path("src/block_pool.zig") });
+    block_pool_mod.addImport("vulkan", vulkan_mod);
+
+    const block_table_mod = b.createModule(.{ .root_source_file = b.path("src/block_table.zig") });
+    block_table_mod.addImport("vulkan", vulkan_mod);
+
+    const vulkan_context_mod = b.createModule(.{ .root_source_file = b.path("src/vulkan_context.zig") });
+    vulkan_context_mod.addImport("vulkan", vulkan_mod);
+    vulkan_context_mod.addOptions("config", options);
+
+    const buffer_manager_mod = b.createModule(.{ .root_source_file = b.path("src/buffer_manager.zig") });
+    buffer_manager_mod.addImport("vulkan", vulkan_mod);
+
+    block_pool_tests.root_module.addImport("block_pool", block_pool_mod);
+    block_pool_tests.root_module.addImport("block_table", block_table_mod);
+    block_pool_tests.root_module.addImport("vulkan_context", vulkan_context_mod);
+    block_pool_tests.root_module.addImport("buffer_manager", buffer_manager_mod);
+    block_pool_tests.linkSystemLibrary("vulkan");
+    block_pool_tests.linkLibC();
+
+    const run_block_pool_tests = b.addRunArtifact(block_pool_tests);
+    const block_pool_test_step = b.step("test-block-pool", "Run block pool tests");
+    block_pool_test_step.dependOn(&run_block_pool_tests.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_attention_tests.step);
+    test_step.dependOn(&run_block_pool_tests.step);
 
     // All tests
     const all_test_step = b.step("test-all", "Run all tests");
     all_test_step.dependOn(&run_attention_tests.step);
+    all_test_step.dependOn(&run_block_pool_tests.step);
 
     // Benchmark
     const benchmark = b.addExecutable(.{
