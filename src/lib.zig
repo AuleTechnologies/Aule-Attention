@@ -45,6 +45,10 @@ const attention_f16_amd_spv = @embedFile("attention_f16_amd_spv");
 // Optimized FP32 shader (vectorized loads, block skipping)
 const attention_f32_fast_spv = @embedFile("attention_f32_fast_spv");
 
+// Paged attention shader (PagedAttention with block pool)
+const attention_paged_spv = @embedFile("attention_paged_spv");
+const copy_kv_to_paged_spv = @embedFile("copy_kv_to_paged_spv");
+
 // Re-export ShaderVariant for external use
 pub const ShaderVariant = @import("attention_gpu.zig").ShaderVariant;
 
@@ -75,6 +79,8 @@ export fn aule_init() callconv(.C) i32 {
         attention_f32_fast_spv, // Optimized FP32 shader
         attention_f16_spv, // FP16 shader
         attention_f16_amd_spv, // FP16 AMD-optimized
+        attention_paged_spv, // PagedAttention shader
+        copy_kv_to_paged_spv, // K/V copy shader for paged attention
     ) catch |err| {
         setError("Failed to initialize backend: {}", .{err});
         log.err("Backend init failed: {}", .{err});
@@ -522,6 +528,43 @@ export fn aule_attention_forward_gpu(
     return 0;
 }
 
+/// PagedAttention forward pass with block-based KV cache
+/// Uses vLLM-style paged memory management for efficient KV cache
+export fn aule_attention_forward_paged(
+    q_handle: TensorHandle,
+    k_handle: TensorHandle,
+    v_handle: TensorHandle,
+    output_handle: TensorHandle,
+    rot_cos_handle: TensorHandle,
+    rot_sin_handle: TensorHandle,
+    causal: i32,
+    window_size: i32,
+) callconv(.C) i32 {
+    var ctx = global_ctx orelse return -1;
+
+    const q = tensor_storage[@intCast(q_handle - 1)] orelse return -1;
+    const k = tensor_storage[@intCast(k_handle - 1)] orelse return -1;
+    const v = tensor_storage[@intCast(v_handle - 1)] orelse return -1;
+    const o = tensor_storage[@intCast(output_handle - 1)] orelse return -1;
+
+    // Optional handles (0 means null)
+    var rot_cos: ?*Tensor = null;
+    if (rot_cos_handle != 0) {
+        rot_cos = tensor_storage[@intCast(rot_cos_handle - 1)];
+    }
+
+    var rot_sin: ?*Tensor = null;
+    if (rot_sin_handle != 0) {
+        rot_sin = tensor_storage[@intCast(rot_sin_handle - 1)];
+    }
+
+    ctx.pagedAttention(q, k, v, o, rot_cos, rot_sin, causal != 0, window_size) catch |err| {
+        setError("PagedAttention failed: {}", .{err});
+        return -3;
+    };
+    return 0;
+}
+
 export fn aule_spatial_sort(
     keys_handle: TensorHandle,
     values_handle: TensorHandle,
@@ -529,7 +572,7 @@ export fn aule_spatial_sort(
     sort_dim: u32,
 ) callconv(.C) i32 {
     var ctx = global_ctx orelse return -1;
-    
+
     const keys = tensor_storage[@intCast(keys_handle - 1)] orelse return -1;
     const values = tensor_storage[@intCast(values_handle - 1)] orelse return -1;
     const indices = tensor_storage[@intCast(indices_handle - 1)] orelse return -1;

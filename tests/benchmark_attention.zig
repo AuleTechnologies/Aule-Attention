@@ -17,7 +17,7 @@ pub fn main() !void {
     // Configuration (Back to larger size)
     const batch = 4;
     const heads = 8;
-    const seq = 256;
+    const seq = 512;
     const dim = 64;
     const shape = [4]u32{batch, heads, seq, dim};
     const total_elements = batch * heads * seq * dim;
@@ -48,7 +48,7 @@ pub fn main() !void {
 
     // Warmup
     std.debug.print("Warming up kernel...\n", .{});
-    try ctx.attention(&q_t, &k_t, &v_t, &o_t, false);
+    try ctx.attention(&q_t, &k_t, &v_t, &o_t, null, null, false, -1);
 
     // Benchmark Loop (Compute Only)
     const iterations = 50;
@@ -57,7 +57,7 @@ pub fn main() !void {
     std.debug.print("Running {} iterations (Compute only)...\n", .{iterations});
     const start = timer.read();
     for (0..iterations) |_| {
-        try ctx.attention(&q_t, &k_t, &v_t, &o_t, false);
+    try ctx.attention(&q_t, &k_t, &v_t, &o_t, null, null, false, -1);
     }
     const end = timer.read();
 

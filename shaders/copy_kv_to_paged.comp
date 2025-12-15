@@ -1,0 +1,95 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// Compute shader to copy contiguous K/V tensors into paged block pool format
+//
+// Input layout:  K[batch, num_kv_heads, seq_len, head_dim]
+// Output layout: KVPool[physical_block, 2, num_kv_heads, 32, head_dim]
+//                where 2 = [K, V] and 32 = tokens per block
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint32_t batch_size;
+    uint32_t num_kv_heads;
+    uint32_t seq_len;
+    uint32_t head_dim;
+    uint32_t max_blocks_per_request;
+    uint32_t num_physical_blocks;
+} pc;
+
+// Input buffers (contiguous)
+layout(std430, set = 0, binding = 0) readonly buffer KeyBuffer {
+    float data[];
+} K;
+
+layout(std430, set = 0, binding = 1) readonly buffer ValueBuffer {
+    float data[];
+} V;
+
+// Block table: [batch_size, max_blocks_per_request]
+// Maps logical block index to physical block ID
+layout(std430, set = 0, binding = 2) readonly buffer BlockTableBuffer {
+    int32_t data[];
+} BlockTable;
+
+// KV Pool (paged): [num_physical_blocks, 2, num_kv_heads, 32, head_dim]
+layout(std430, set = 0, binding = 3) writeonly buffer KVPoolBuffer {
+    float data[];
+} KVPool;
+
+// Get physical block ID from block table
+int32_t getPhysicalBlock(uint batch_idx, uint logical_block) {
+    uint table_idx = batch_idx * pc.max_blocks_per_request + logical_block;
+    return BlockTable.data[table_idx];
+}
+
+// Compute flat index into contiguous K/V tensor
+uint getContiguousIndex(uint batch, uint head, uint token, uint dim) {
+    // Layout: [batch, num_kv_heads, seq_len, head_dim]
+    return ((batch * pc.num_kv_heads + head) * pc.seq_len + token) * pc.head_dim + dim;
+}
+
+// Compute flat index into paged KV pool
+uint getPagedIndex(uint physical_block, uint kv_idx, uint head, uint block_token, uint dim) {
+    // Layout: [num_physical_blocks, 2, num_kv_heads, 32, head_dim]
+    // kv_idx: 0=K, 1=V
+    return ((((physical_block * 2 + kv_idx) * pc.num_kv_heads + head) * 32 + block_token) * pc.head_dim) + dim;
+}
+
+void main() {
+    // Each workgroup processes one batch item
+    uint batch_idx = gl_WorkGroupID.x;
+    uint head_idx = gl_WorkGroupID.y;
+    uint token_idx = gl_WorkGroupID.z * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+
+    if (batch_idx >= pc.batch_size || head_idx >= pc.num_kv_heads || token_idx >= pc.seq_len) {
+        return;
+    }
+
+    // Calculate which block this token belongs to
+    uint logical_block = token_idx / 32;
+    uint block_token = token_idx % 32;
+
+    // Get physical block ID from block table
+    int32_t physical_block_signed = getPhysicalBlock(batch_idx, logical_block);
+    if (physical_block_signed < 0) {
+        // Block not allocated (shouldn't happen, but be safe)
+        return;
+    }
+    uint physical_block = uint(physical_block_signed);
+
+    // Copy all elements for this token from K and V
+    for (uint dim = 0; dim < pc.head_dim; dim++) {
+        uint src_idx = getContiguousIndex(batch_idx, head_idx, token_idx, dim);
+
+        // Copy K (kv_idx=0)
+        uint dst_k_idx = getPagedIndex(physical_block, 0, head_idx, block_token, dim);
+        KVPool.data[dst_k_idx] = K.data[src_idx];
+
+        // Copy V (kv_idx=1)
+        uint dst_v_idx = getPagedIndex(physical_block, 1, head_idx, block_token, dim);
+        KVPool.data[dst_v_idx] = V.data[src_idx];
+    }
+}

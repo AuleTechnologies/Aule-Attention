@@ -59,7 +59,7 @@ pub const AttentionContext = struct {
 
     /// Initialize with automatic backend selection
     pub fn init(allocator: std.mem.Allocator, generic_shader: []const u8, amd_shader: []const u8) BackendError!Self {
-        return initWithBackward(allocator, generic_shader, amd_shader, null, null, null, null, null, null, null, null, null, null, null, null);
+        return initWithBackward(allocator, generic_shader, amd_shader, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
     }
 
     /// Initialize with backward pass support
@@ -79,6 +79,8 @@ pub const AttentionContext = struct {
         fast_shader: ?[]const u8,
         fp16_shader: ?[]const u8,
         fp16_amd_shader: ?[]const u8,
+        paged_shader: ?[]const u8,
+        copy_kv_shader: ?[]const u8,
     ) BackendError!Self {
         // Check for forced backend via environment
         const forced_backend = std.process.getEnvVarOwned(allocator, "AULE_BACKEND") catch |err| switch (err) {
@@ -91,7 +93,7 @@ pub const AttentionContext = struct {
             if (std.mem.eql(u8, backend_name, "hip")) {
                 return initHip(allocator);
             } else if (std.mem.eql(u8, backend_name, "vulkan")) {
-                return initVulkan(allocator, generic_shader, amd_shader, forward_lse_shader, backward_shader, sort_shader, gravity_shader, radix_count_shader, radix_scan_shader, radix_scatter_shader, iota_shader, magnitude_shader, fast_shader, fp16_shader, fp16_amd_shader);
+                return initVulkan(allocator, generic_shader, amd_shader, forward_lse_shader, backward_shader, sort_shader, gravity_shader, radix_count_shader, radix_scan_shader, radix_scatter_shader, iota_shader, magnitude_shader, fast_shader, fp16_shader, fp16_amd_shader, paged_shader, copy_kv_shader);
             } else if (std.mem.eql(u8, backend_name, "cpu")) {
                 return initCpu(allocator);
             }
@@ -106,7 +108,7 @@ pub const AttentionContext = struct {
             return ctx;
         } else |_| {}
 
-        if (initVulkan(allocator, generic_shader, amd_shader, forward_lse_shader, backward_shader, sort_shader, gravity_shader, radix_count_shader, radix_scan_shader, radix_scatter_shader, iota_shader, magnitude_shader, fast_shader, fp16_shader, fp16_amd_shader)) |ctx| {
+        if (initVulkan(allocator, generic_shader, amd_shader, forward_lse_shader, backward_shader, sort_shader, gravity_shader, radix_count_shader, radix_scan_shader, radix_scatter_shader, iota_shader, magnitude_shader, fast_shader, fp16_shader, fp16_amd_shader, paged_shader, copy_kv_shader)) |ctx| {
             return ctx;
         } else |_| {}
 
@@ -129,9 +131,11 @@ pub const AttentionContext = struct {
         fast_shader: ?[]const u8,
         fp16_shader: ?[]const u8,
         fp16_amd_shader: ?[]const u8,
+        paged_shader: ?[]const u8,
+        copy_kv_shader: ?[]const u8,
     ) BackendError!Self {
         const engine = allocator.create(AttentionEngine) catch return BackendError.OutOfMemory;
-        engine.* = AttentionEngine.initWithBackward(allocator, generic_shader, amd_shader, forward_lse_shader, backward_shader, sort_shader, gravity_shader, radix_count_shader, radix_scan_shader, radix_scatter_shader, iota_shader, magnitude_shader, fast_shader, fp16_shader, fp16_amd_shader) catch |err| {
+        engine.* = AttentionEngine.initWithBackward(allocator, generic_shader, amd_shader, forward_lse_shader, backward_shader, sort_shader, gravity_shader, radix_count_shader, radix_scan_shader, radix_scatter_shader, iota_shader, magnitude_shader, fast_shader, fp16_shader, fp16_amd_shader, paged_shader, copy_kv_shader) catch |err| {
             allocator.destroy(engine);
             return switch (err) {
                 error.OutOfMemory => BackendError.OutOfMemory,
@@ -362,6 +366,52 @@ pub const AttentionContext = struct {
                 // Use CPU reference implementation
                 try cpuAttention(Q, K, V, output);
             },
+        }
+    }
+
+    /// PagedAttention: Forward pass with block-based KV cache
+    pub fn pagedAttention(
+        self: *Self,
+        Q: *Tensor,
+        K: *Tensor,
+        V: *Tensor,
+        output: *Tensor,
+        rot_cos: ?*Tensor,
+        rot_sin: ?*Tensor,
+        causal: bool,
+        window_size: i32,
+    ) BackendError!void {
+        switch (self.backend) {
+            .vulkan => {
+                const ctx = self.vulkan_ctx orelse return BackendError.BackendInitFailed;
+
+                // Extract Vulkan handles for RoPE if present
+                var rot_cos_vk: ?*const GpuTensor = null;
+                if (rot_cos) |t| {
+                    if (t.backend == .vulkan) rot_cos_vk = t.handle.vulkan;
+                }
+
+                var rot_sin_vk: ?*const GpuTensor = null;
+                if (rot_sin) |t| {
+                    if (t.backend == .vulkan) rot_sin_vk = t.handle.vulkan;
+                }
+
+                ctx.forwardPaged(
+                    Q.handle.vulkan,
+                    K.handle.vulkan,
+                    V.handle.vulkan,
+                    output.handle.vulkan,
+                    rot_cos_vk,
+                    rot_sin_vk,
+                    causal,
+                    window_size,
+                ) catch |err| switch (err) {
+                    error.InvalidShape, error.ShapeMismatch => return BackendError.ShapeMismatch,
+                    else => return BackendError.ComputeFailed,
+                };
+            },
+            .hip => return BackendError.ComputeFailed, // Not implemented
+            .cpu => return BackendError.ComputeFailed, // Not implemented
         }
     }
 

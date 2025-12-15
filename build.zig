@@ -120,6 +120,16 @@ pub fn build(b: *std.Build) void {
     const attention_f16_amd_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
     const attention_f16_amd_spv = attention_f16_amd_compile.addOutputFileArg("attention_f16_amd.spv");
     attention_f16_amd_compile.addFileArg(b.path("shaders/attention_f16_amd.comp"));
+
+    // --- Paged Attention Shader (for PagedAttention feature) ---
+    const attention_paged_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
+    const attention_paged_spv = attention_paged_compile.addOutputFileArg("attention_paged.spv");
+    attention_paged_compile.addFileArg(b.path("shaders/attention_paged.comp"));
+
+    // K/V copy shader for paged attention
+    const copy_kv_paged_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
+    const copy_kv_paged_spv = copy_kv_paged_compile.addOutputFileArg("copy_kv_to_paged.spv");
+    copy_kv_paged_compile.addFileArg(b.path("shaders/copy_kv_to_paged.comp"));
     // --------------------------
 
     // Main library (shared)
@@ -151,6 +161,10 @@ pub fn build(b: *std.Build) void {
     // FP16 shader imports
     lib.root_module.addAnonymousImport("attention_f16_spv", .{ .root_source_file = attention_f16_spv });
     lib.root_module.addAnonymousImport("attention_f16_amd_spv", .{ .root_source_file = attention_f16_amd_spv });
+
+    // Paged attention shaders
+    lib.root_module.addAnonymousImport("attention_paged_spv", .{ .root_source_file = attention_paged_spv });
+    lib.root_module.addAnonymousImport("copy_kv_to_paged_spv", .{ .root_source_file = copy_kv_paged_spv });
 
     // Link Vulkan on native builds only - cross-compilation uses runtime dynamic loading
     const is_native = target.query.isNative();
@@ -191,6 +205,10 @@ pub fn build(b: *std.Build) void {
     static_lib.root_module.addAnonymousImport("attention_f16_spv", .{ .root_source_file = attention_f16_spv });
     static_lib.root_module.addAnonymousImport("attention_f16_amd_spv", .{ .root_source_file = attention_f16_amd_spv });
 
+    // Paged attention shaders (static)
+    static_lib.root_module.addAnonymousImport("attention_paged_spv", .{ .root_source_file = attention_paged_spv });
+    static_lib.root_module.addAnonymousImport("copy_kv_to_paged_spv", .{ .root_source_file = copy_kv_paged_spv });
+
     static_lib.linkSystemLibrary("vulkan");
     static_lib.linkLibC();
 
@@ -202,7 +220,7 @@ pub fn build(b: *std.Build) void {
     });
     attention_tests.root_module.addImport("vulkan", vulkan_mod);
     attention_tests.root_module.addOptions("config", options);
-    attention_tests.root_module.addImport("aule", static_lib.root_module);
+    attention_tests.root_module.addImport("aule", &static_lib.root_module);
     attention_tests.linkSystemLibrary("vulkan");
     attention_tests.linkLibC();
 
@@ -218,7 +236,7 @@ pub fn build(b: *std.Build) void {
     });
     block_pool_tests.root_module.addImport("vulkan", vulkan_mod);
     block_pool_tests.root_module.addOptions("config", options);
-    block_pool_tests.root_module.addImport("aule", static_lib.root_module);
+    block_pool_tests.root_module.addImport("aule", &static_lib.root_module);
 
     // Create modules with vulkan dependency
     const block_pool_mod = b.createModule(.{ .root_source_file = b.path("src/block_pool.zig") });
@@ -245,6 +263,26 @@ pub fn build(b: *std.Build) void {
     const block_pool_test_step = b.step("test-block-pool", "Run block pool tests");
     block_pool_test_step.dependOn(&run_block_pool_tests.step);
 
+    // Tests - paged attention
+    const paged_attention_tests = b.addTest(.{
+        .root_source_file = b.path("tests/test_paged_attention.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    paged_attention_tests.root_module.addImport("vulkan", vulkan_mod);
+    paged_attention_tests.root_module.addOptions("config", options);
+    paged_attention_tests.root_module.addImport("aule", &static_lib.root_module);
+    paged_attention_tests.root_module.addAnonymousImport("attention_f32_spv", .{ .root_source_file = attention_f32_spv });
+    paged_attention_tests.root_module.addAnonymousImport("attention_amd_spv", .{ .root_source_file = attention_amd_spv });
+    paged_attention_tests.root_module.addAnonymousImport("attention_paged_spv", .{ .root_source_file = attention_paged_spv });
+    paged_attention_tests.root_module.addAnonymousImport("copy_kv_to_paged_spv", .{ .root_source_file = copy_kv_paged_spv });
+    paged_attention_tests.linkSystemLibrary("vulkan");
+    paged_attention_tests.linkLibC();
+
+    const run_paged_attention_tests = b.addRunArtifact(paged_attention_tests);
+    const paged_attention_test_step = b.step("test-paged", "Run paged attention tests");
+    paged_attention_test_step.dependOn(&run_paged_attention_tests.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_attention_tests.step);
     test_step.dependOn(&run_block_pool_tests.step);
@@ -253,6 +291,7 @@ pub fn build(b: *std.Build) void {
     const all_test_step = b.step("test-all", "Run all tests");
     all_test_step.dependOn(&run_attention_tests.step);
     all_test_step.dependOn(&run_block_pool_tests.step);
+    all_test_step.dependOn(&run_paged_attention_tests.step);
 
     // Benchmark
     const benchmark = b.addExecutable(.{
@@ -261,7 +300,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize, // Use build arg
     });
-    benchmark.root_module.addImport("aule", static_lib.root_module);
+    benchmark.root_module.addImport("aule", &static_lib.root_module);
     // Note: static_lib already has vulkan/libc linked, but we might need to ensure transient deps work
     // Ideally we link shared 'lib' or static 'static_lib' module.
     

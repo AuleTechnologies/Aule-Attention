@@ -5,12 +5,16 @@ const buffer_manager_pkg = @import("buffer_manager.zig");
 const BufferManager = buffer_manager_pkg.BufferManager;
 const Buffer = buffer_manager_pkg.Buffer;
 const AttentionPipeline = @import("attention_pipeline.zig").AttentionPipeline;
+const PagedAttentionPipeline = @import("paged_attention_pipeline.zig").PagedAttentionPipeline;
+const CopyKVPipeline = @import("copy_kv_pipeline.zig").CopyKVPipeline;
 const BackwardPipelines = @import("attention_backward_pipeline.zig");
 const ForwardWithLsePipeline = BackwardPipelines.ForwardWithLsePipeline;
 const BackwardPipeline = BackwardPipelines.BackwardPipeline;
 const SortPipeline = @import("sort_pipeline.zig").SortPipeline;
 const GravityPipeline = @import("gravity_pipeline.zig").GravityPipeline;
 const GpuTensor = @import("gpu_tensor.zig").GpuTensor;
+const BlockPool = @import("block_pool.zig").BlockPool;
+const BlockTable = @import("block_table.zig").BlockTable;
 
 const log = std.log.scoped(.attention_gpu);
 
@@ -31,6 +35,8 @@ pub const AttentionEngine = struct {
     fast_pipeline: ?AttentionPipeline, // Optimized FP32 shader
     fp16_pipeline: ?AttentionPipeline, // FP16 shader
     fp16_amd_pipeline: ?AttentionPipeline, // FP16 AMD-optimized
+    paged_pipeline: ?PagedAttentionPipeline, // PagedAttention with block pool
+    copy_kv_pipeline: ?CopyKVPipeline, // K/V scatter to paged format
     active_variant: ShaderVariant,
     forward_lse_pipeline: ?ForwardWithLsePipeline,
     backward_pipeline: ?BackwardPipeline,
@@ -42,12 +48,16 @@ pub const AttentionEngine = struct {
     radix_hist_buffer: ?Buffer = null,
     radix_inds_temp: ?Buffer = null,
 
+    // PagedAttention block management (optional, initialized on first paged forward)
+    block_pool: ?BlockPool = null,
+    block_table: ?BlockTable = null,
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, generic_shader: []const u8, amd_shader: []const u8) !Self {
         // Warning: This legacy init will fail if new shaders are required by pipeline
         // We should pass null for optional shaders
-        return initWithBackward(allocator, generic_shader, amd_shader, null, null, null, null, null, null, null, null, null, null, null, null);
+        return initWithBackward(allocator, generic_shader, amd_shader, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
     }
 
     pub fn initWithBackward(
@@ -66,6 +76,8 @@ pub const AttentionEngine = struct {
         fast_shader: ?[]const u8,
         fp16_shader: ?[]const u8,
         fp16_amd_shader: ?[]const u8,
+        paged_shader: ?[]const u8,
+        copy_kv_shader: ?[]const u8,
     ) !Self {
         var ctx = try allocator.create(VulkanContext);
         errdefer allocator.destroy(ctx);
@@ -103,6 +115,20 @@ pub const AttentionEngine = struct {
                 fp16_amd_pipeline = try AttentionPipeline.init(ctx, s);
                 log.info("FP16 AMD-optimized shader loaded (64-wide wavefront)", .{});
             }
+        }
+
+        var paged_pipeline: ?PagedAttentionPipeline = null;
+        if (paged_shader) |s| {
+            log.info("Initializing PagedAttention pipeline...", .{});
+            paged_pipeline = try PagedAttentionPipeline.init(ctx, s);
+            log.info("PagedAttention shader loaded (block-based KV cache)", .{});
+        }
+
+        var copy_kv_pipeline: ?CopyKVPipeline = null;
+        if (copy_kv_shader) |s| {
+            log.info("Initializing CopyKV pipeline...", .{});
+            copy_kv_pipeline = try CopyKVPipeline.init(ctx, s);
+            log.info("CopyKV shader loaded (K/V scatter to paged format)", .{});
         }
 
         // Select default active variant based on GPU capabilities
@@ -145,6 +171,8 @@ pub const AttentionEngine = struct {
             .fast_pipeline = fast_pipeline,
             .fp16_pipeline = fp16_pipeline,
             .fp16_amd_pipeline = fp16_amd_pipeline,
+            .paged_pipeline = paged_pipeline,
+            .copy_kv_pipeline = copy_kv_pipeline,
             .active_variant = active_variant,
             .forward_lse_pipeline = forward_lse_pipeline,
             .backward_pipeline = backward_pipeline,
@@ -300,10 +328,15 @@ pub const AttentionEngine = struct {
         if (self.gravity_pipeline) |*gp| gp.deinit();
         if (self.radix_hist_buffer) |*b| self.buffer_manager.destroyBuffer(b);
         if (self.radix_inds_temp) |*b| self.buffer_manager.destroyBuffer(b);
+        // Deinit PagedAttention block management
+        if (self.block_table) |*bt| bt.deinit();
+        if (self.block_pool) |*bp| bp.deinit();
         // Deinit all shader pipelines
         if (self.fast_pipeline) |*p| p.deinit();
         if (self.fp16_pipeline) |*p| p.deinit();
         if (self.fp16_amd_pipeline) |*p| p.deinit();
+        if (self.paged_pipeline) |*p| p.deinit();
+        if (self.copy_kv_pipeline) |*p| p.deinit();
         self.pipeline.deinit();
         self.ctx.deinit();
         self.allocator.destroy(self.ctx);
@@ -444,6 +477,230 @@ pub const AttentionEngine = struct {
     pub fn getBufferManager(self: *Self) *const BufferManager {
         return &self.buffer_manager;
     }
+
+    /// PagedAttention forward pass with block-based KV cache
+    /// Lazily initializes BlockPool and BlockTable on first call
+    /// Automatically allocates blocks for sequences and copies K/V into paged format
+    pub fn forwardPaged(
+        self: *Self,
+        Q: *const GpuTensor,
+        K: *const GpuTensor,
+        V: *const GpuTensor,
+        output: *GpuTensor,
+        rot_cos: ?*const GpuTensor,
+        rot_sin: ?*const GpuTensor,
+        causal: bool,
+        window_size: i32,
+    ) !void {
+        const paged_pipe = self.paged_pipeline orelse return error.PagedPipelineNotInitialized;
+
+        // Validate shapes
+        if (Q.ndim != 4 or K.ndim != 4 or V.ndim != 4 or output.ndim != 4) {
+            return error.InvalidShape;
+        }
+
+        const batch_size = Q.shape[0];
+        const num_heads = Q.shape[1];
+        const seq_len = Q.shape[2];
+        const head_dim = Q.shape[3];
+        const num_kv_heads = K.shape[1];
+        const key_seq_len = K.shape[2];
+
+        // Validate shapes
+        if (K.shape[0] != batch_size or (num_heads % num_kv_heads != 0) or K.shape[3] != head_dim) {
+            return error.ShapeMismatch;
+        }
+        if (V.shape[0] != batch_size or V.shape[1] != num_kv_heads or
+            V.shape[2] != key_seq_len or V.shape[3] != head_dim) {
+            return error.ShapeMismatch;
+        }
+        if (output.shape[0] != batch_size or output.shape[1] != num_heads or
+            output.shape[2] != seq_len or output.shape[3] != head_dim) {
+            return error.ShapeMismatch;
+        }
+        if (head_dim > 64) {
+            return error.HeadDimTooLarge;
+        }
+
+        // Lazy initialization of block pool and table
+        if (self.block_pool == null) {
+            const BlockPoolConfig = @import("block_pool.zig").BlockPoolConfig;
+            const config = BlockPoolConfig{
+                .initial_blocks = 512,
+                .blocks_per_chunk = 512,
+                .max_blocks = 8192,
+                .block_size = 32, // Matches BLOCK_SIZE in shader
+                .num_kv_heads = num_kv_heads,
+                .head_dim = head_dim,
+            };
+            self.block_pool = try BlockPool.init(self.allocator, &self.buffer_manager, config);
+            log.info("Initialized BlockPool: {} blocks, block_size=32", .{config.initial_blocks});
+        }
+
+        if (self.block_table == null) {
+            // max_blocks per request = max_seq_len / block_size
+            const max_blocks_per_request = 256; // 256 * 32 = 8192 tokens max
+            self.block_table = try BlockTable.init(
+                self.allocator,
+                self.ctx,
+                &self.buffer_manager,
+                batch_size,
+                max_blocks_per_request,
+            );
+            log.info("Initialized BlockTable: batch={}, max_blocks={}", .{batch_size, max_blocks_per_request});
+        }
+
+        var block_pool = &self.block_pool.?;
+        var block_table = &self.block_table.?;
+
+        // Calculate blocks needed per sequence
+        const tokens_per_block = 32;
+        const blocks_needed = (key_seq_len + tokens_per_block - 1) / tokens_per_block;
+
+        log.debug("PagedAttention: seq_len={}, blocks_needed={}", .{key_seq_len, blocks_needed});
+
+        // Allocate blocks for each sequence in batch
+        var allocated_blocks = try self.allocator.alloc([]u32, batch_size);
+        defer {
+            for (allocated_blocks) |blocks| {
+                self.allocator.free(blocks);
+            }
+            self.allocator.free(allocated_blocks);
+        }
+
+        for (0..batch_size) |batch_idx| {
+            allocated_blocks[batch_idx] = try self.allocator.alloc(u32, blocks_needed);
+            for (0..blocks_needed) |block_idx| {
+                const physical_block = try block_pool.allocateBlock();
+                allocated_blocks[batch_idx][block_idx] = physical_block;
+                block_table.set(
+                    @intCast(batch_idx),
+                    @intCast(block_idx),
+                    @intCast(physical_block),
+                );
+            }
+        }
+
+        // Sync block table to GPU
+        try block_table.sync();
+
+        // Copy K/V data into paged format
+        try self.copyKVToPaged(K, V, block_table, batch_size, num_kv_heads, key_seq_len, head_dim);
+
+        // RoPE validation
+        var rope_size: u64 = 0;
+        var has_rope = false;
+        var cos_buf: ?vk.Buffer = null;
+        var sin_buf: ?vk.Buffer = null;
+
+        if (rot_cos) |c| {
+            if (rot_sin) |s| {
+                has_rope = true;
+                rope_size = c.byteSize();
+                cos_buf = c.getBuffer();
+                sin_buf = s.getBuffer();
+            } else {
+                return error.MissingRotarySin;
+            }
+        } else if (rot_sin != null) {
+            return error.MissingRotaryCos;
+        }
+
+        // Update descriptors with paged buffers
+        const num_physical_blocks = block_pool.total_blocks;
+        const block_table_size = block_table.batch_size * block_table.max_blocks * @sizeOf(i32);
+        const kv_pool_size = num_physical_blocks * 2 * num_kv_heads * tokens_per_block * head_dim * @sizeOf(f32);
+
+        paged_pipe.updateDescriptors(
+            Q.getBuffer(),
+            output.getBuffer(),
+            cos_buf,
+            sin_buf,
+            block_table.getStagingBuffer(), // Use staging buffer directly (MVP)
+            block_pool.getBuffer(),
+            Q.byteSize(),
+            output.byteSize(),
+            rope_size,
+            block_table_size,
+            kv_pool_size,
+        );
+
+        log.info("Dispatching Paged: B={d}, H={d}, KVH={d}, QLen={d}, KLen={d}, blocks={d}", .{
+            batch_size, num_heads, num_kv_heads, seq_len, key_seq_len, num_physical_blocks,
+        });
+
+        // Dispatch paged attention shader
+        try paged_pipe.dispatch(
+            batch_size,
+            num_heads,
+            num_kv_heads,
+            seq_len,
+            key_seq_len,
+            head_dim,
+            causal,
+            has_rope,
+            window_size,
+            block_table.max_blocks,
+            num_physical_blocks,
+        );
+
+        // Free allocated blocks (for MVP - in production we'd keep them cached)
+        for (0..batch_size) |batch_idx| {
+            for (allocated_blocks[batch_idx]) |physical_block| {
+                block_pool.freeBlock(physical_block);
+            }
+        }
+    }
+
+    /// Copy contiguous K/V tensors into paged block pool format using compute shader
+    fn copyKVToPaged(
+        self: *Self,
+        K: *const GpuTensor,
+        V: *const GpuTensor,
+        block_table: *const BlockTable,
+        batch_size: u32,
+        num_kv_heads: u32,
+        seq_len: u32,
+        head_dim: u32,
+    ) !void {
+        const copy_pipe = self.copy_kv_pipeline orelse return error.CopyKVPipelineNotInitialized;
+        const block_pool = &(self.block_pool orelse return error.BlockPoolNotInitialized);
+
+        // Get buffer sizes
+        const k_size = K.buffer.size;
+        const v_size = V.buffer.size;
+        const block_table_size = block_table.table_buffer.size;
+        const kv_pool_size = block_pool.kv_pool_buffer.size;
+
+        // Update descriptor bindings
+        // Use staging buffer (MVP - same as PagedAttention pipeline)
+        copy_pipe.updateDescriptors(
+            K.buffer.buffer,
+            V.buffer.buffer,
+            block_table.staging_buffer.buffer,  // Use staging buffer, not table_buffer
+            block_pool.kv_pool_buffer.buffer,
+            k_size,
+            v_size,
+            block_table_size,
+            kv_pool_size,
+        );
+
+        // Dispatch copy shader
+        try copy_pipe.dispatch(
+            batch_size,
+            num_kv_heads,
+            seq_len,
+            head_dim,
+            block_table.max_blocks,
+            block_pool.total_blocks,
+        );
+
+        log.info("K/V tensors copied to paged format: {} tokens across {} blocks", .{
+            seq_len,
+            (seq_len + 31) / 32,
+        });
+    }
+
 
     /// Forward pass with LSE output (for training)
     /// Returns output and log-sum-exp values needed for backward pass

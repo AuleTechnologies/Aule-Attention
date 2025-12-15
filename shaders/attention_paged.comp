@@ -329,10 +329,10 @@ void main() {
         barrier();
     }
 
-    // Write output - vectorized
-    if (is_active && batch_idx < params.batch_size) {
+    // Write output - only one thread per row writes (thread 0)
+    if (is_active && batch_idx < params.batch_size && local_col == 0) {
         float inv_sum = 1.0 / row_sum;
-        for (uint v = local_col; v < head_dim_vec4; v += BLOCK_SIZE) {
+        for (uint v = 0; v < head_dim_vec4; v++) {
             vec4 out_val = output_acc[v] * inv_sum;
             O.data[qs_off + global_row * head_dim_vec4 + v] = out_val;
         }

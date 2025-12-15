@@ -1,16 +1,15 @@
 .{
-    .name = .aule_attention,
+    .name = "aule_attention",
     .version = "0.1.0",
-    .fingerprint = 0xcd5c4b1a5993367f,
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.13.0",
     .dependencies = .{
         .vulkan = .{
-            .url = "https://github.com/Snektron/vulkan-zig/archive/55f3bb3c24de5d57aabc21881d944ea1f141bda1.tar.gz",
-            .hash = "vulkan-0.0.0-AAAAAD9KAwCWtAIcS7NdNz1YmjEjfirINJaepQQB1zzF",
+            .url = "https://github.com/Snektron/vulkan-zig/archive/4321b8b.tar.gz",
+            .hash = "12209449a4ffca1976eeeb1b6d5ff04ee688011a6842c79ca78a2de3c12ac7060dc9",
         },
         .vulkan_headers = .{
             .url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.3.283.tar.gz",
-            .hash = "N-V-__8AAAkkoQGn5z1yoNVrwqZfnYmZp8AZ5CJgoHRMQI0c",
+            .hash = "1220a7e73d72a0d56bc2a65f9d8999a7c019e42260a0744c408d1cded111bc205e10",
         },
     },
     .paths = .{
