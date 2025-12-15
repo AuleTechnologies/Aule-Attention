@@ -1,11 +1,12 @@
 .{
-    .name = "aule_attention",
-    .version = "0.1.0",
-    .minimum_zig_version = "0.13.0",
+    .name = .aule,
+    .version = "0.3.5",
+    .fingerprint = 0x47454bdf80920a0,
+    .minimum_zig_version = "0.14.0",
     .dependencies = .{
         .vulkan = .{
-            .url = "https://github.com/Snektron/vulkan-zig/archive/4321b8b.tar.gz",
-            .hash = "12209449a4ffca1976eeeb1b6d5ff04ee688011a6842c79ca78a2de3c12ac7060dc9",
+            .url = "https://github.com/Snektron/vulkan-zig/archive/55f3bb3c24de5d57aabc21881d944ea1f141bda1.tar.gz",
+            .hash = "122096b4021c4bb35d373d589a31237e2ac834969ea50401d73cc50780aaec8ea367",
         },
         .vulkan_headers = .{
             .url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.3.283.tar.gz",

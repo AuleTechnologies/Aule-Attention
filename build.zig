@@ -220,7 +220,7 @@ pub fn build(b: *std.Build) void {
     });
     attention_tests.root_module.addImport("vulkan", vulkan_mod);
     attention_tests.root_module.addOptions("config", options);
-    attention_tests.root_module.addImport("aule", &static_lib.root_module);
+    attention_tests.root_module.addImport("aule", static_lib.root_module);
     attention_tests.linkSystemLibrary("vulkan");
     attention_tests.linkLibC();
 
@@ -236,7 +236,7 @@ pub fn build(b: *std.Build) void {
     });
     block_pool_tests.root_module.addImport("vulkan", vulkan_mod);
     block_pool_tests.root_module.addOptions("config", options);
-    block_pool_tests.root_module.addImport("aule", &static_lib.root_module);
+    block_pool_tests.root_module.addImport("aule", static_lib.root_module);
 
     // Create modules with vulkan dependency
     const block_pool_mod = b.createModule(.{ .root_source_file = b.path("src/block_pool.zig") });
@@ -271,7 +271,7 @@ pub fn build(b: *std.Build) void {
     });
     paged_attention_tests.root_module.addImport("vulkan", vulkan_mod);
     paged_attention_tests.root_module.addOptions("config", options);
-    paged_attention_tests.root_module.addImport("aule", &static_lib.root_module);
+    paged_attention_tests.root_module.addImport("aule", static_lib.root_module);
     paged_attention_tests.root_module.addAnonymousImport("attention_f32_spv", .{ .root_source_file = attention_f32_spv });
     paged_attention_tests.root_module.addAnonymousImport("attention_amd_spv", .{ .root_source_file = attention_amd_spv });
     paged_attention_tests.root_module.addAnonymousImport("attention_paged_spv", .{ .root_source_file = attention_paged_spv });
@@ -300,7 +300,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize, // Use build arg
     });
-    benchmark.root_module.addImport("aule", &static_lib.root_module);
+    benchmark.root_module.addImport("aule", static_lib.root_module);
     // Note: static_lib already has vulkan/libc linked, but we might need to ensure transient deps work
     // Ideally we link shared 'lib' or static 'static_lib' module.
     

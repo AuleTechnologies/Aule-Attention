@@ -35,7 +35,7 @@ pub const BlockPool = struct {
         buffer_manager: *const BufferManager,
         config: BlockPoolConfig,
     ) !Self {
-        log.info("Initializing BlockPool: {} initial blocks, {} max", .{
+        log.info("Initializing BlockPool: {d} initial blocks, {d} max", .{
             config.initial_blocks,
             config.max_blocks,
         });
@@ -79,33 +79,33 @@ pub const BlockPool = struct {
         }
 
         if (self.free_blocks.items.len == 0) {
-            log.err("Block pool exhausted (max {} blocks)", .{self.config.max_blocks});
+            log.err("Block pool exhausted (max {d} blocks)", .{self.config.max_blocks});
             return error.BlockPoolExhausted;
         }
 
-        const block_id = self.free_blocks.pop();
-        log.debug("Allocated block {}, {} free remaining", .{ block_id, self.free_blocks.items.len });
+        const block_id = self.free_blocks.pop() orelse return error.BlockPoolExhausted;
+        log.debug("Allocated block {d}, {d} free remaining", .{ block_id, self.free_blocks.items.len });
         return block_id;
     }
 
     pub fn freeBlock(self: *Self, block_id: u32) void {
         std.debug.assert(block_id < self.total_blocks);
         self.free_blocks.append(block_id) catch {
-            log.err("Failed to free block {}", .{block_id});
+            log.err("Failed to free block {d}", .{block_id});
             return;
         };
-        log.debug("Freed block {}, {} free total", .{ block_id, self.free_blocks.items.len });
+        log.debug("Freed block {d}, {d} free total", .{ block_id, self.free_blocks.items.len });
     }
 
     pub fn growPool(self: *Self) !void {
         const new_total = self.total_blocks + self.config.blocks_per_chunk;
 
         if (new_total > self.config.max_blocks) {
-            log.warn("Cannot grow pool beyond max {} blocks", .{self.config.max_blocks});
+            log.warn("Cannot grow pool beyond max {d} blocks", .{self.config.max_blocks});
             return error.MaxBlocksReached;
         }
 
-        log.info("Growing block pool: {} -> {} blocks", .{ self.total_blocks, new_total });
+        log.info("Growing block pool: {d} -> {d} blocks", .{ self.total_blocks, new_total });
 
         // Allocate new larger buffer
         const new_size = new_total * 2 * self.config.num_kv_heads *
@@ -132,7 +132,7 @@ pub const BlockPool = struct {
             try self.free_blocks.append(i);
         }
 
-        log.info("Block pool grown successfully, {} free blocks", .{self.free_blocks.items.len});
+        log.info("Block pool grown successfully, {d} free blocks", .{self.free_blocks.items.len});
     }
 
     pub fn getBuffer(self: *const Self) vk.Buffer {
