@@ -1,0 +1,340 @@
+#version 450
+
+// FlashAttention-2 Forward Pass - Paged Memory Version
+// Based on attention_f32_fast.comp with paged KV cache
+// Key features:
+//   1. Block-based KV cache (32 tokens per block)
+//   2. Block table for logical→physical mapping
+//   3. Shared KV pool across requests
+//   4. Same optimizations as fast shader (32x32 blocks, vec4 loads)
+
+layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+
+// Storage buffers
+layout(std430, set = 0, binding = 0) readonly buffer QBuffer { vec4 data[]; } Q;
+layout(std430, set = 0, binding = 1) readonly buffer KBuffer { vec4 data[]; } K;  // Unused in paged mode
+layout(std430, set = 0, binding = 2) readonly buffer VBuffer { vec4 data[]; } V;  // Unused in paged mode
+layout(std430, set = 0, binding = 3) writeonly buffer OutputBuffer { vec4 data[]; } O;
+layout(std430, set = 0, binding = 4) readonly buffer RotaryCosBuffer { float data[]; } RotCos;
+layout(std430, set = 0, binding = 5) readonly buffer RotarySinBuffer { float data[]; } RotSin;
+
+// Paged attention buffers
+layout(std430, set = 0, binding = 6) readonly buffer BlockTableBuffer {
+    int data[];  // [batch_size * max_blocks], -1 = sentinel
+} BlockTable;
+
+layout(std430, set = 0, binding = 7) readonly buffer KVPoolBuffer {
+    vec4 data[];  // [num_blocks * 2 * num_kv_heads * 32 * (head_dim/4)]
+} KVPool;
+
+layout(push_constant) uniform PushConstants {
+    uint batch_size;
+    uint num_heads;
+    uint seq_len;
+    uint head_dim;
+    float scale;
+    uint causal;
+    uint has_rope;
+    uint num_kv_heads;
+    uint key_seq_len;
+    int window_size;
+    uint max_blocks_per_request;  // For block table indexing
+    uint num_physical_blocks;     // Total blocks in pool
+} params;
+
+const uint BLOCK_SIZE = 32;
+const uint HEAD_DIM_VEC4 = 16;  // 64 / 4 = 16 vec4s
+
+// Shared memory with padding to reduce bank conflicts
+// Using [33] stride instead of [32] avoids 32-way bank conflicts on AMD
+shared vec4 s_Q[BLOCK_SIZE][HEAD_DIM_VEC4 + 1];
+shared vec4 s_K[BLOCK_SIZE][HEAD_DIM_VEC4 + 1];
+shared vec4 s_V[BLOCK_SIZE][HEAD_DIM_VEC4 + 1];
+shared float s_S[BLOCK_SIZE][BLOCK_SIZE + 1];  // Scores with padding
+
+// Get physical block ID for a given request and token position
+int getPhysicalBlock(uint request_id, uint token_pos) {
+    uint logical_block = token_pos / BLOCK_SIZE;
+
+    if (logical_block >= params.max_blocks_per_request) {
+        return -1;  // Out of bounds
+    }
+
+    uint table_idx = request_id * params.max_blocks_per_request + logical_block;
+    return BlockTable.data[table_idx];
+}
+
+// Load K from paged pool
+vec4 loadPagedK(uint request_id, uint kv_head, uint token_pos, uint vec_idx) {
+    int phys_block = getPhysicalBlock(request_id, token_pos);
+    if (phys_block < 0) {
+        return vec4(0.0);  // Sentinel or out of bounds
+    }
+
+    uint offset_in_block = token_pos % BLOCK_SIZE;
+
+    // KV pool layout: [num_blocks, 2, num_kv_heads, block_size, head_dim/4]
+    // K is at index 0 in the "2" dimension
+    uint pool_idx = uint(phys_block) * (2 * params.num_kv_heads * BLOCK_SIZE * HEAD_DIM_VEC4)
+                  + 0 * (params.num_kv_heads * BLOCK_SIZE * HEAD_DIM_VEC4)  // K=0
+                  + kv_head * (BLOCK_SIZE * HEAD_DIM_VEC4)
+                  + offset_in_block * HEAD_DIM_VEC4
+                  + vec_idx;
+
+    return KVPool.data[pool_idx];
+}
+
+// Load V from paged pool
+vec4 loadPagedV(uint request_id, uint kv_head, uint token_pos, uint vec_idx) {
+    int phys_block = getPhysicalBlock(request_id, token_pos);
+    if (phys_block < 0) {
+        return vec4(0.0);
+    }
+
+    uint offset_in_block = token_pos % BLOCK_SIZE;
+
+    // V is at index 1 in the "2" dimension
+    uint pool_idx = uint(phys_block) * (2 * params.num_kv_heads * BLOCK_SIZE * HEAD_DIM_VEC4)
+                  + 1 * (params.num_kv_heads * BLOCK_SIZE * HEAD_DIM_VEC4)  // V=1
+                  + kv_head * (BLOCK_SIZE * HEAD_DIM_VEC4)
+                  + offset_in_block * HEAD_DIM_VEC4
+                  + vec_idx;
+
+    return KVPool.data[pool_idx];
+}
+
+void main() {
+    uint local_row = gl_LocalInvocationID.y;
+    uint local_col = gl_LocalInvocationID.x;
+    uint thread_id = local_row * BLOCK_SIZE + local_col;
+
+    uint batch_head_idx = gl_WorkGroupID.z;
+    uint batch_idx = batch_head_idx / params.num_heads;
+    uint head_idx = batch_head_idx % params.num_heads;
+
+    // GQA
+    uint ratio = params.num_heads / params.num_kv_heads;
+    uint kv_head_idx = head_idx / ratio;
+    uint kv_batch_head_idx = batch_idx * params.num_kv_heads + kv_head_idx;
+
+    uint block_row = gl_WorkGroupID.y;
+    uint global_row = block_row * BLOCK_SIZE + local_row;
+
+    bool is_active = (batch_idx < params.batch_size) && (global_row < params.seq_len);
+
+    // Base offsets (in vec4 units)
+    uint head_dim_vec4 = params.head_dim / 4;
+    uint qs_off = batch_head_idx * params.seq_len * head_dim_vec4;
+    uint ks_off = kv_batch_head_idx * params.key_seq_len * head_dim_vec4;
+
+    // Initialize accumulators (in registers)
+    float row_max = -1e30;
+    float row_sum = 0.0;
+    vec4 output_acc[HEAD_DIM_VEC4];
+
+    for (uint i = 0; i < HEAD_DIM_VEC4; i++) {
+        output_acc[i] = vec4(0.0);
+    }
+
+    // Load Q tile - vectorized with optional RoPE
+    // Each thread loads multiple vec4s to fill the tile
+    uint q_row = local_row;
+    uint half_dim = params.head_dim / 2;
+    for (uint v = local_col; v < head_dim_vec4; v += BLOCK_SIZE) {
+        vec4 q_val = vec4(0.0);
+        if (is_active && v < head_dim_vec4) {
+            q_val = Q.data[qs_off + global_row * head_dim_vec4 + v];
+
+            // Apply RoPE if enabled
+            if (params.has_rope != 0u) {
+                // Each vec4 contains 4 floats: d*4, d*4+1, d*4+2, d*4+3
+                // RoPE pairs: (0,1), (2,3), (4,5), ...
+                // rot_idx for pair (2i, 2i+1) = row * (D/2) + i
+                uint base_d = v * 4;  // Starting dimension for this vec4
+
+                // Process pairs within this vec4
+                // Pair 0: (base_d, base_d+1), Pair 1: (base_d+2, base_d+3)
+                uint rot_idx_0 = global_row * half_dim + (base_d / 2);
+                uint rot_idx_1 = global_row * half_dim + (base_d / 2) + 1;
+
+                float cos0 = RotCos.data[rot_idx_0];
+                float sin0 = RotSin.data[rot_idx_0];
+                float cos1 = RotCos.data[rot_idx_1];
+                float sin1 = RotSin.data[rot_idx_1];
+
+                // Rotate pair 0: q[0], q[1]
+                float q0_rot = q_val.x * cos0 - q_val.y * sin0;
+                float q1_rot = q_val.x * sin0 + q_val.y * cos0;
+
+                // Rotate pair 1: q[2], q[3]
+                float q2_rot = q_val.z * cos1 - q_val.w * sin1;
+                float q3_rot = q_val.z * sin1 + q_val.w * cos1;
+
+                q_val = vec4(q0_rot, q1_rot, q2_rot, q3_rot);
+            }
+        }
+        s_Q[q_row][v] = q_val;
+    }
+    barrier();
+
+    // Calculate window bounds for block skipping
+    uint num_kv_blocks = (params.key_seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    uint first_kv_block = 0;
+    uint last_kv_block = num_kv_blocks;
+
+    if (params.window_size > 0) {
+        // Calculate which blocks actually need to be processed
+        uint block_start_row = block_row * BLOCK_SIZE;
+        uint block_end_row = min(block_start_row + BLOCK_SIZE, params.seq_len);
+
+        if (params.causal != 0u) {
+            // Causal: rows [block_start, block_end) can attend to [row - window + 1, row]
+            // First valid K position for any row in this block
+            uint first_valid_k = 0;
+            if (block_start_row >= uint(params.window_size)) {
+                first_valid_k = block_start_row - uint(params.window_size) + 1;
+            }
+            // Last valid K position (inclusive) for any row in this block
+            uint last_valid_k = block_end_row - 1;
+
+            first_kv_block = first_valid_k / BLOCK_SIZE;
+            last_kv_block = (last_valid_k / BLOCK_SIZE) + 1;
+        } else {
+            // Bidirectional: centered window
+            uint half_window = uint(params.window_size) / 2;
+            uint first_valid_k = 0;
+            if (block_start_row > half_window) {
+                first_valid_k = block_start_row - half_window;
+            }
+            uint last_valid_k = min(block_end_row + half_window, params.key_seq_len - 1);
+
+            first_kv_block = first_valid_k / BLOCK_SIZE;
+            last_kv_block = (last_valid_k / BLOCK_SIZE) + 1;
+        }
+
+        last_kv_block = min(last_kv_block, num_kv_blocks);
+    }
+
+    // Iterate over K/V blocks - WITH SKIPPING
+    for (uint kv_block = first_kv_block; kv_block < last_kv_block; kv_block++) {
+        uint kv_start = kv_block * BLOCK_SIZE;
+        uint kv_row = kv_start + local_row;
+        bool kv_valid = kv_row < params.key_seq_len;
+
+        // Load K tile - vectorized with optional RoPE
+        for (uint v = local_col; v < head_dim_vec4; v += BLOCK_SIZE) {
+            vec4 k_val = vec4(0.0);
+            if (kv_valid && batch_idx < params.batch_size && v < head_dim_vec4) {
+                // Load K from paged pool instead of contiguous buffer
+                k_val = loadPagedK(batch_idx, kv_head_idx, kv_row, v);
+
+                // Apply RoPE if enabled
+                if (params.has_rope != 0u) {
+                    uint base_d = v * 4;
+                    uint rot_idx_0 = kv_row * half_dim + (base_d / 2);
+                    uint rot_idx_1 = kv_row * half_dim + (base_d / 2) + 1;
+
+                    float cos0 = RotCos.data[rot_idx_0];
+                    float sin0 = RotSin.data[rot_idx_0];
+                    float cos1 = RotCos.data[rot_idx_1];
+                    float sin1 = RotSin.data[rot_idx_1];
+
+                    // Rotate pair 0
+                    float k0_rot = k_val.x * cos0 - k_val.y * sin0;
+                    float k1_rot = k_val.x * sin0 + k_val.y * cos0;
+
+                    // Rotate pair 1
+                    float k2_rot = k_val.z * cos1 - k_val.w * sin1;
+                    float k3_rot = k_val.z * sin1 + k_val.w * cos1;
+
+                    k_val = vec4(k0_rot, k1_rot, k2_rot, k3_rot);
+                }
+            }
+            s_K[local_row][v] = k_val;
+        }
+
+        // Load V tile - vectorized
+        for (uint v = local_col; v < head_dim_vec4; v += BLOCK_SIZE) {
+            vec4 v_val = vec4(0.0);
+            if (kv_valid && batch_idx < params.batch_size && v < head_dim_vec4) {
+                // Load V from paged pool instead of contiguous buffer
+                v_val = loadPagedV(batch_idx, kv_head_idx, kv_row, v);
+            }
+            s_V[local_row][v] = v_val;
+        }
+        barrier();
+
+        // Compute Q @ K^T score for this thread's (row, col)
+        float score = 0.0;
+        for (uint v = 0; v < head_dim_vec4; v++) {
+            vec4 q = s_Q[local_row][v];
+            vec4 k = s_K[local_col][v];
+            score += dot(q, k);  // vec4 dot product - 4 FMAs in one instruction
+        }
+        score *= params.scale;
+
+        // Masking
+        uint global_col = kv_start + local_col;
+        bool is_masked = !is_active || global_col >= params.key_seq_len;
+
+        if (params.causal != 0u && global_col > global_row) is_masked = true;
+
+        if (params.window_size > 0) {
+            if (params.causal != 0u) {
+                if (int(global_row) - int(global_col) >= params.window_size) is_masked = true;
+            } else {
+                int half_window = params.window_size / 2;
+                int distance = abs(int(global_row) - int(global_col));
+                if (distance > half_window) is_masked = true;
+            }
+        }
+
+        if (is_masked) score = -1e30;
+        s_S[local_row][local_col] = score;
+        barrier();
+
+        // Online Softmax - each thread handles its own row
+        if (is_active) {
+            // Find block max
+            float block_max = -1e30;
+            for (uint c = 0; c < BLOCK_SIZE; c++) {
+                block_max = max(block_max, s_S[local_row][c]);
+            }
+
+            float new_max = max(row_max, block_max);
+            float correction = exp(row_max - new_max);
+
+            // Rescale previous accumulator
+            row_sum *= correction;
+            for (uint v = 0; v < HEAD_DIM_VEC4; v++) {
+                output_acc[v] *= correction;
+            }
+
+            // Accumulate this block
+            float block_sum = 0.0;
+            for (uint c = 0; c < BLOCK_SIZE; c++) {
+                float p = exp(s_S[local_row][c] - new_max);
+                block_sum += p;
+
+                // Accumulate weighted V
+                for (uint v = 0; v < HEAD_DIM_VEC4; v++) {
+                    output_acc[v] += p * s_V[c][v];
+                }
+            }
+
+            row_sum += block_sum;
+            row_max = new_max;
+        }
+        barrier();
+    }
+
+    // Write output - vectorized
+    if (is_active && batch_idx < params.batch_size) {
+        float inv_sum = 1.0 / row_sum;
+        for (uint v = local_col; v < head_dim_vec4; v += BLOCK_SIZE) {
+            vec4 out_val = output_acc[v] * inv_sum;
+            O.data[qs_off + global_row * head_dim_vec4 + v] = out_val;
+        }
+    }
+}
