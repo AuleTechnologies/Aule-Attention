@@ -408,5 +408,6 @@ We are grateful to these projects and their maintainers for making hardware-agno
 ---
 
 <p align="center">
-  Made with dedication by <a href="https://auletechnologies.com">Aule Technologies</a>
+  Created by <strong>Yeabsira Teshome</strong><br>
+  Founder & CEO, <a href="https://auletechnologies.com">Aule Technologies</a>
 </p>
