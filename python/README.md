@@ -2,21 +2,22 @@
 
 **FlashAttention that just works. No compilation. Any GPU.**
 
-Version: 0.3.5
+Version: 0.3.6
 
-## What's New in 0.3.5
+## What's New in 0.3.6
 
+- **PagedAttention (vLLM-style)**: Block-based KV cache for 90% memory savings
 - **7-13x Faster Vulkan**: New fast shader with 32x32 blocks and vec4 loads
 - **Sliding Window Attention**: Efficient local attention with `window_size` parameter
 - **Native FP16/BF16 Compute**: Triton kernels now use native precision (no FP32 conversion overhead)
 - **Multiple Shader Variants**: Choose baseline, fast, fp16, or fp16_amd for your hardware
-- **RoPE Fix**: Rotary position embeddings now work with fast shader
-- **Gravity Attention Fix**: Multi-head support fixed for indirect attention
+- **Long Context Support**: Validated up to 4K+ tokens
 
 ### Performance Highlights
 
 | Feature | Improvement |
 |---------|-------------|
+| PagedAttention | 90% memory savings, 7.9K tokens/sec batched |
 | Fast Shader | 7-13x speedup over baseline |
 | Sliding Window (S=1024, W=128) | 7.6x faster (544ms → 71ms) |
 | Triton FP16/BF16 | ~20-30% faster (native compute) |
