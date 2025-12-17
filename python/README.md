@@ -2,7 +2,28 @@
 
 **FlashAttention that just works. No compilation. Any GPU.**
 
-Version: 0.3.6
+Version: 0.4.0
+
+## What's New in 0.4.0
+
+- **AMD MI300X Optimized Kernel**: New Triton FlashAttention-2 kernel tuned for CDNA3
+  - Auto-detects AMD GPUs and routes to optimized kernel
+  - Uses `exp2` optimization (faster than `exp` on AMD hardware)
+  - Extended autotune configs for 7B/13B/70B/405B models
+
+### MI300X Benchmark Results (vs PyTorch SDPA)
+
+| Config | Speedup |
+|--------|---------|
+| Llama-70B 4K context | **+20.4%** |
+| Llama-70B 8K context | **+19.9%** |
+| Llama-70B batch=4 | **+21.0%** |
+| Long context (32K-128K) | **+17-22%** |
+| Average across all configs | **+15%** |
+
+## What's New in 0.3.7
+
+- **Windows DLL included** - Cross-compiled Windows support with PagedAttention
 
 ## What's New in 0.3.6
 

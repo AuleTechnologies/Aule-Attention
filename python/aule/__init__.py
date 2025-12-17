@@ -20,7 +20,7 @@ Usage:
     out = flash_attention(q, k, v, causal=True)
 """
 
-__version__ = "0.3.9"
+__version__ = "0.4.0"
 __author__ = "Aule Technologies"
 
 # Backend availability flags
