@@ -20,15 +20,39 @@ Usage:
     out = flash_attention(q, k, v, causal=True)
 """
 
-__version__ = "0.3.5"
+__version__ = "0.3.9"
 __author__ = "Aule Technologies"
 
 # Backend availability flags
 _triton_available = False
+_triton_amd_available = False
 _vulkan_available = False
 _cpu_available = True
+_is_amd_gpu = False
 
-# Try Triton backend first (best for ROCm and CUDA)
+# Detect AMD GPU
+def _detect_amd_gpu():
+    """Detect if running on AMD GPU with ROCm."""
+    try:
+        import torch
+        if hasattr(torch.version, 'hip') and torch.version.hip is not None:
+            return True
+    except:
+        pass
+    return False
+
+_is_amd_gpu = _detect_amd_gpu()
+
+# Try AMD-optimized Triton backend first (for MI300X, MI200, RDNA3)
+if _is_amd_gpu:
+    try:
+        from .triton_flash_amd import flash_attention_amd as _flash_attention_amd
+        from .triton_flash_amd import get_amd_gpu_arch as _get_amd_gpu_arch
+        _triton_amd_available = True
+    except ImportError:
+        pass
+
+# Try generic Triton backend (for NVIDIA and fallback)
 try:
     from .triton_flash import (
         flash_attention_triton,
@@ -124,8 +148,13 @@ def flash_attention(query, key, value, rot_cos=None, rot_sin=None, causal=True, 
 
     if is_torch:
         if use_triton:
-            from .triton_flash import flash_attention_triton
-            return flash_attention_triton(query, key, value, causal=causal, scale=scale)
+            # Use AMD-optimized kernel on AMD GPUs for maximum performance
+            if _triton_amd_available and _is_amd_gpu:
+                from .triton_flash_amd import flash_attention_amd
+                return flash_attention_amd(query, key, value, causal=causal, scale=scale)
+            else:
+                from .triton_flash import flash_attention_triton
+                return flash_attention_triton(query, key, value, causal=causal, scale=scale)
 
         if use_vulkan:
             q_np = query.cpu().numpy()
@@ -360,6 +389,8 @@ def uninstall():
 def get_available_backends():
     """Return list of available backends."""
     backends = []
+    if _triton_amd_available:
+        backends.append('triton-amd')
     if _triton_available:
         backends.append('triton')
     if _vulkan_available:
@@ -373,12 +404,22 @@ def get_backend_info():
     """Return detailed backend information."""
     info = {}
 
+    if _triton_amd_available:
+        import torch
+        arch = _get_amd_gpu_arch() if '_get_amd_gpu_arch' in dir() else 'unknown'
+        info['triton-amd'] = {
+            'available': True,
+            'device': torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A',
+            'architecture': arch,
+            'description': 'AMD-optimized Triton FlashAttention-2 (MI300X tuned)',
+        }
+
     if _triton_available:
         import torch
         info['triton'] = {
             'available': True,
             'device': torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A',
-            'description': 'Triton FlashAttention-2 (our kernel)',
+            'description': 'Triton FlashAttention-2 (generic kernel)',
         }
 
     if _vulkan_available:
@@ -412,25 +453,38 @@ def print_backend_info():
     print(f"Available backends: {backends}")
     print()
 
+    idx = 1
+    if _triton_amd_available:
+        import torch
+        arch = _get_amd_gpu_arch()
+        print(f"[{idx}] TRITON-AMD (primary)")
+        print(f"    GPU: {torch.cuda.get_device_name(0)}")
+        print(f"    Architecture: {arch}")
+        print("    Status: AMD-optimized FlashAttention-2 (MI300X tuned)")
+        print()
+        idx += 1
+
     if _triton_available:
         import torch
-        print("[1] TRITON (primary)")
+        print(f"[{idx}] TRITON")
         print(f"    GPU: {torch.cuda.get_device_name(0)}")
-        print("    Status: OUR FlashAttention-2 kernel")
+        print("    Status: Generic FlashAttention-2 kernel")
         print()
+        idx += 1
 
     if _vulkan_available:
         try:
             with Aule() as aule:
                 info = aule.get_device_info()
-                print(f"[{'2' if _triton_available else '1'}] VULKAN")
+                print(f"[{idx}] VULKAN")
                 print(f"    GPU: {info.get('device_name', 'Unknown')}")
-                print("    Status: OUR Vulkan compute shader")
+                print("    Status: Vulkan compute shader")
                 print()
+                idx += 1
         except:
             pass
 
-    print(f"[{'3' if _triton_available else '2'}] CPU")
+    print(f"[{idx}] CPU")
     print("    Status: NumPy fallback")
     print()
     print("=" * 60)

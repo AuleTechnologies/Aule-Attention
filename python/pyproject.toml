@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aule-attention"
-version = "0.3.6"
+version = "0.3.9"
 description = "FlashAttention that just works. No compilation. Any GPU. AMD ROCm, NVIDIA CUDA, Intel, Apple via Vulkan."
 readme = "README.md"
 license = {text = "MIT"}
