@@ -91,7 +91,7 @@ def get_autotune_configs():
 
 @triton.autotune(
     configs=get_autotune_configs(),
-    key=['seq_len_q', 'seq_len_k', 'head_dim', 'IS_CAUSAL'],
+    key=['head_dim'],  # Only key on head_dim - same config for all seq_lens (critical for generation)
 )
 @triton.jit
 def _flash_attn_fwd_amd(
