@@ -103,7 +103,7 @@ def _flash_attn_fwd_amd(
     stride_lb, stride_lh, stride_lm,
     num_heads_q, num_heads_kv,
     seq_len_q, seq_len_k, head_dim,
-    scale,
+    scale, window_size,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -168,26 +168,52 @@ def _flash_attn_fwd_amd(
         # Maps to AMD MFMA instructions
         s = tl.dot(q, tl.trans(k)) * scale
 
+        # Use a large negative number instead of -inf to avoid numerical issues
+        NEG_INF = -1e20
+
         # Apply causal mask
         if IS_CAUSAL:
             causal_mask = offs_m[:, None] >= offs_n_curr[None, :]
-            s = tl.where(causal_mask, s, float('-inf'))
+            s = tl.where(causal_mask, s, NEG_INF)
+
+        # Sliding window mask: keep positions where q_pos - k_pos < window_size
+        # For causal: attend to positions in range [q_pos - window_size + 1, q_pos]
+        if window_size > 0:
+            window_mask = (offs_m[:, None] - offs_n_curr[None, :]) < window_size
+            s = tl.where(window_mask, s, NEG_INF)
 
         # Bounds mask for sequence length
-        s = tl.where(offs_n_curr[None, :] < seq_len_k, s, float('-inf'))
+        s = tl.where(offs_n_curr[None, :] < seq_len_k, s, NEG_INF)
 
         # Online softmax computation (FlashAttention-2 algorithm)
         # Use exp2 for faster computation on AMD (maps to v_exp_f32)
         m_ij = tl.max(s, axis=1)
-        m_new = tl.maximum(m_i, m_ij)
+
+        # Handle case where entire row in block is masked (m_ij ~ NEG_INF)
+        # In this case, we should skip the update for that row to avoid NaN
+        row_has_valid = m_ij > (NEG_INF + 1.0)
+
+        # For rows with no valid entries, keep old max
+        # Use 0.0 as a safe value for m_ij when computing m_new
+        # This avoids -inf - (-inf) = nan in alpha calculation
+        m_ij_safe = tl.where(row_has_valid, m_ij, 0.0)
+        m_new = tl.where(row_has_valid, tl.maximum(m_i, m_ij_safe), m_i)
 
         # Correction factor using exp2 (faster than exp on AMD)
         # exp2(x) = 2^x, so we scale by log2(e) ≈ 1.4427
+        # When m_i = -inf and row_has_valid, m_new will be a valid value
+        # so alpha = exp2(-inf - valid) = 0, which is correct
+        # When !row_has_valid, m_new = m_i, so m_i - m_new = 0, alpha = 1
         LOG2E: tl.constexpr = 1.4426950408889634
         alpha = tl.math.exp2((m_i - m_new) * LOG2E)
+        # Clamp alpha to avoid inf * 0 = nan issues
+        alpha = tl.where(m_i > NEG_INF, alpha, 0.0)
 
         # Compute softmax weights using exp2
         p = tl.math.exp2((s - m_new[:, None]) * LOG2E)
+
+        # Zero out rows with no valid entries to prevent garbage accumulation
+        p = tl.where(row_has_valid[:, None], p, 0.0)
 
         # Update running sum
         l_i = l_i * alpha + tl.sum(p, axis=1)
@@ -195,7 +221,8 @@ def _flash_attn_fwd_amd(
         # Accumulate output: acc = acc * alpha + P @ V
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 
-        m_i = m_new
+        # Only update m_i for rows that had valid entries
+        m_i = tl.where(row_has_valid, m_new, m_i)
 
     # Normalize output
     acc = acc / l_i[:, None]
@@ -363,11 +390,12 @@ _AUTOTUNE_CACHE = {}
 
 class FlashAttentionAMDFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, causal=True, scale=None):
+    def forward(ctx, q, k, v, causal=True, scale=None, window_size=-1):
         batch, heads_q, seq_len_q, head_dim = q.shape
         _, heads_kv, seq_len_k, _ = k.shape
 
-        assert heads_q % heads_kv == 0, f"heads_q ({heads_q}) must be divisible by heads_kv ({heads_kv})"
+        assert heads_q % heads_kv == 0, \
+            f"heads_q ({heads_q}) must be divisible by heads_kv ({heads_kv})"
 
         if scale is None:
             scale = 1.0 / math.sqrt(head_dim)
@@ -379,7 +407,8 @@ class FlashAttentionAMDFunc(torch.autograd.Function):
         v = v.contiguous()
 
         out = torch.empty_like(q)
-        L = torch.empty(batch, heads_q, seq_len_q, device=q.device, dtype=torch.float32)
+        L = torch.empty(batch, heads_q, seq_len_q,
+                        device=q.device, dtype=torch.float32)
 
         BLOCK_K = triton.next_power_of_2(head_dim)
 
@@ -398,7 +427,7 @@ class FlashAttentionAMDFunc(torch.autograd.Function):
             L.stride(0), L.stride(1), L.stride(2),
             heads_q, heads_kv,
             seq_len_q, seq_len_k, head_dim,
-            scale,
+            scale, window_size,
             BLOCK_K=BLOCK_K,
             IS_CAUSAL=causal, STORE_LSE=True,
         )
@@ -407,6 +436,7 @@ class FlashAttentionAMDFunc(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, out, L)
         ctx.scale = scale
         ctx.causal = causal
+        ctx.window_size = window_size
         ctx.heads_q = heads_q
         ctx.heads_kv = heads_kv
         ctx.BLOCK_K = BLOCK_K
@@ -466,7 +496,8 @@ class FlashAttentionAMDFunc(torch.autograd.Function):
             num_stages=1, num_warps=4,
         )
 
-        return dq.to(ctx.orig_dtype), dk.to(ctx.orig_dtype), dv.to(ctx.orig_dtype), None, None
+        return (dq.to(ctx.orig_dtype), dk.to(ctx.orig_dtype),
+                dv.to(ctx.orig_dtype), None, None, None)
 
 
 def flash_attention_amd(
@@ -475,13 +506,14 @@ def flash_attention_amd(
     v: torch.Tensor,
     causal: bool = True,
     scale: float = None,
+    window_size: int = -1,
 ) -> torch.Tensor:
     """
     AMD-optimized FlashAttention-2 with autotuning.
 
     Automatically finds optimal kernel configuration for MI300X and MI200 GPUs.
-    First call for each (seq_len, head_dim, causal) combo runs autotuning,
-    subsequent calls use cached optimal config.
+    First call for each head_dim runs autotuning, subsequent calls use cached
+    optimal config.
 
     Args:
         q: Query [batch, heads_q, seq_len_q, head_dim]
@@ -489,6 +521,7 @@ def flash_attention_amd(
         v: Value [batch, heads_kv, seq_len_k, head_dim]
         causal: Apply causal masking
         scale: Attention scale (default: 1/sqrt(head_dim))
+        window_size: Sliding window size (-1 for full attention)
 
     Returns:
         Output [batch, heads_q, seq_len_q, head_dim]
@@ -500,7 +533,208 @@ def flash_attention_amd(
     assert k.shape[2] == v.shape[2]
     assert q.shape[1] % k.shape[1] == 0
 
-    return FlashAttentionAMDFunc.apply(q, k, v, causal, scale)
+    return FlashAttentionAMDFunc.apply(q, k, v, causal, scale, window_size)
+
+
+# =============================================================================
+# PAGED ATTENTION KERNEL (vLLM-compatible)
+# =============================================================================
+
+@triton.jit
+def _paged_attention_fwd_amd(
+    Q, K_cache, V_cache, Out,
+    Block_tables,
+    Context_lens,
+    stride_qb, stride_qh, stride_qd,
+    stride_kb, stride_kblk, stride_kh, stride_kd,
+    stride_vb, stride_vblk, stride_vh, stride_vd,
+    stride_btb, stride_btm,
+    stride_ob, stride_oh, stride_od,
+    num_heads_q, num_heads_kv,
+    head_dim, block_size, max_context_len,
+    scale, window_size,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    MAX_NUM_BLOCKS: tl.constexpr,
+):
+    """
+    PagedAttention kernel for decode phase (single query token per batch).
+
+    Compatible with vLLM-style block tables.
+    K_cache, V_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+    Block_tables: [batch, max_blocks_per_seq]
+    """
+    pid_bh = tl.program_id(0)
+
+    pid_b = pid_bh // num_heads_q
+    pid_h_q = pid_bh % num_heads_q
+
+    # GQA mapping
+    heads_per_kv = num_heads_q // num_heads_kv
+    pid_h_kv = pid_h_q // heads_per_kv
+
+    # Get context length for this batch
+    context_len = tl.load(Context_lens + pid_b)
+    num_blocks = tl.cdiv(context_len, BLOCK_SIZE)
+
+    # Load query [head_dim]
+    offs_d = tl.arange(0, BLOCK_K)
+    q_ptrs = Q + pid_b * stride_qb + pid_h_q * stride_qh + offs_d * stride_qd
+    q = tl.load(q_ptrs, mask=offs_d < head_dim, other=0.0).to(tl.float32)
+
+    # Use a large negative number instead of -inf to avoid numerical issues
+    NEG_INF = -1e20
+
+    # Initialize accumulators
+    acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+    m_i = NEG_INF
+    l_i = 0.0
+
+    # Iterate over all blocks up to MAX_NUM_BLOCKS (compile-time constant)
+    offs_blk = tl.arange(0, BLOCK_SIZE)
+
+    for block_idx in range(MAX_NUM_BLOCKS):
+        # Get physical block number from block table
+        # Use block 0 for out-of-range to avoid invalid memory access
+        bt_idx = tl.minimum(block_idx, num_blocks - 1)
+        physical_block = tl.load(Block_tables + pid_b * stride_btb + bt_idx)
+
+        # Load K block [BLOCK_SIZE, head_dim]
+        k_ptrs = (K_cache + physical_block * stride_kb +
+                  offs_blk[:, None] * stride_kblk +
+                  pid_h_kv * stride_kh + offs_d[None, :] * stride_kd)
+        k_mask = (offs_blk[:, None] < BLOCK_SIZE) & (offs_d[None, :] < head_dim)
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+
+        # Compute attention scores: q @ k^T * scale
+        s = tl.sum(q[None, :] * k, axis=1) * scale  # [BLOCK_SIZE]
+
+        # Mask invalid positions (including blocks beyond num_blocks)
+        token_positions = block_idx * BLOCK_SIZE + offs_blk
+        valid_mask = token_positions < context_len
+
+        # Sliding window mask
+        if window_size > 0:
+            window_mask = (context_len - 1 - token_positions) < window_size
+            valid_mask = valid_mask & window_mask
+
+        s = tl.where(valid_mask, s, NEG_INF)
+
+        # Online softmax with NaN protection
+        m_ij = tl.max(s)
+
+        # Check if block has any valid positions
+        block_has_valid = m_ij > (NEG_INF + 1.0)
+
+        # For blocks with no valid entries, keep old max to avoid -inf - (-inf) = nan
+        m_ij_safe = tl.where(block_has_valid, m_ij, 0.0)
+        m_new = tl.where(block_has_valid, tl.maximum(m_i, m_ij_safe), m_i)
+
+        LOG2E: tl.constexpr = 1.4426950408889634
+        alpha = tl.math.exp2((m_i - m_new) * LOG2E)
+        # Clamp alpha when m_i is still initial NEG_INF
+        alpha = tl.where(m_i > NEG_INF, alpha, 0.0)
+
+        p = tl.math.exp2((s - m_new) * LOG2E)
+        # Zero out invalid positions
+        p = tl.where(valid_mask, p, 0.0)
+
+        l_i = l_i * alpha + tl.sum(p)
+
+        # Load V block and accumulate
+        v_ptrs = (V_cache + physical_block * stride_vb +
+                  offs_blk[:, None] * stride_vblk +
+                  pid_h_kv * stride_vh + offs_d[None, :] * stride_vd)
+        v = tl.load(v_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        # Only update m_i for blocks with valid entries
+        m_i = tl.where(block_has_valid, m_new, m_i)
+
+    # Normalize
+    acc = acc / l_i
+
+    # Store output
+    out_ptrs = Out + pid_b * stride_ob + pid_h_q * stride_oh + offs_d * stride_od
+    tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=offs_d < head_dim)
+
+
+def flash_attention_paged_amd(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float = None,
+    window_size: int = -1,
+) -> torch.Tensor:
+    """
+    AMD-optimized PagedAttention for decode phase.
+
+    Compatible with vLLM-style block tables for efficient KV cache management.
+
+    Args:
+        q: Query [batch, heads_q, head_dim] - single token per sequence
+        k_cache: Key cache [num_blocks, block_size, num_kv_heads, head_dim]
+        v_cache: Value cache [num_blocks, block_size, num_kv_heads, head_dim]
+        block_tables: Block mapping [batch, max_blocks_per_seq] int32
+        context_lens: Actual seq length per batch [batch] int32
+        scale: Attention scale (default: 1/sqrt(head_dim))
+        window_size: Sliding window size (-1 for full attention)
+
+    Returns:
+        Output [batch, heads_q, head_dim]
+    """
+    # Handle 4D query input (squeeze seq_len dim if 1)
+    if q.dim() == 4:
+        assert q.shape[2] == 1, "PagedAttention only supports single query token"
+        q = q.squeeze(2)
+
+    batch, heads_q, head_dim = q.shape
+    num_blocks_total, block_size, heads_kv, _ = k_cache.shape
+
+    assert heads_q % heads_kv == 0, \
+        f"heads_q ({heads_q}) must be divisible by heads_kv ({heads_kv})"
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(head_dim)
+
+    q = q.contiguous()
+    k_cache = k_cache.contiguous()
+    v_cache = v_cache.contiguous()
+    block_tables = block_tables.contiguous().to(torch.int32)
+    context_lens = context_lens.contiguous().to(torch.int32)
+
+    out = torch.empty(batch, heads_q, head_dim, device=q.device, dtype=q.dtype)
+
+    BLOCK_K = triton.next_power_of_2(head_dim)
+    max_context = int(context_lens.max().item())
+
+    grid = (batch * heads_q,)
+
+    # Calculate max blocks for compile-time loop bound
+    max_num_blocks = (max_context + block_size - 1) // block_size
+
+    _paged_attention_fwd_amd[grid](
+        q, k_cache, v_cache, out,
+        block_tables, context_lens,
+        q.stride(0), q.stride(1), q.stride(2),
+        k_cache.stride(0), k_cache.stride(1),
+        k_cache.stride(2), k_cache.stride(3),
+        v_cache.stride(0), v_cache.stride(1),
+        v_cache.stride(2), v_cache.stride(3),
+        block_tables.stride(0), block_tables.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
+        heads_q, heads_kv,
+        head_dim, block_size, max_context,
+        scale, window_size,
+        BLOCK_SIZE=block_size,
+        BLOCK_K=BLOCK_K,
+        MAX_NUM_BLOCKS=max_num_blocks,
+        num_warps=4, num_stages=1,
+    )
+
+    return out
 
 
 # =============================================================================

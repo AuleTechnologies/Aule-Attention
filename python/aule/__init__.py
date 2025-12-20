@@ -20,7 +20,7 @@ Usage:
     out = flash_attention(q, k, v, causal=True)
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__ = "Aule Technologies"
 
 # Backend availability flags
@@ -47,10 +47,11 @@ _is_amd_gpu = _detect_amd_gpu()
 if _is_amd_gpu:
     try:
         from .triton_flash_amd import flash_attention_amd as _flash_attention_amd
+        from .triton_flash_amd import flash_attention_paged_amd
         from .triton_flash_amd import get_amd_gpu_arch as _get_amd_gpu_arch
         _triton_amd_available = True
     except ImportError:
-        pass
+        flash_attention_paged_amd = None
 
 # Try generic Triton backend (for NVIDIA and fallback)
 try:
@@ -500,6 +501,8 @@ __all__ = [
     "flash_attention_rope",
     "precompute_rope_frequencies",
     "apply_rope_separate",
+    # PagedAttention (vLLM-compatible)
+    "flash_attention_paged_amd",
     # Installation (for ComfyUI, etc.)
     "install",
     "uninstall",
