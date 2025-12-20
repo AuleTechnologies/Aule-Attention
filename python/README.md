@@ -2,7 +2,70 @@
 
 **FlashAttention that just works. No compilation. Any GPU.**
 
-Version: 0.4.0
+Version: 0.5.0
+
+## What's New in 0.5.0
+
+- **Sliding Window Attention**: Mistral-style local attention with `window_size` parameter
+- **PagedAttention**: vLLM-compatible block-based KV cache for efficient serving
+- **Native GQA**: No K/V tensor expansion needed - faster than PyTorch on GQA models
+- **NaN Fix**: Stable numerics for sliding window with fully-masked blocks
+
+### MI300X Benchmark Results (vs PyTorch SDPA)
+
+**GQA Models** (native GQA vs PyTorch expand):
+
+| Config | Speedup |
+|--------|---------|
+| LLaMA-70B 4K context | **+6.1%** |
+| LLaMA-70B batch=4 | **+6.0%** |
+| LLaMA-405B 4K context | **+8.5%** |
+| Mistral batch=8 | **+9.6%** |
+
+**PagedAttention Decode** (batch=8):
+
+| Context Length | Throughput |
+|----------------|------------|
+| 1K tokens | 34,397 tok/s |
+| 2K tokens | 20,083 tok/s |
+| 4K tokens | 10,915 tok/s |
+| 8K tokens | 5,744 tok/s |
+
+**Sliding Window** (window=256 vs full attention):
+
+| Sequence Length | Speedup |
+|-----------------|---------|
+| 2K tokens | +6.0% |
+| 4K tokens | +8.9% |
+| 8K tokens | +11.0% |
+
+### Sliding Window Attention
+
+```python
+from aule import flash_attention
+
+# Mistral-style sliding window (only attend to last N tokens)
+output = flash_attention(q, k, v, causal=True, window_size=256)
+
+# For long sequences, reduces O(N^2) to O(N*W) memory
+# seq=8K, window=256 → 97% memory savings
+```
+
+### PagedAttention (vLLM-compatible)
+
+```python
+from aule import flash_attention_paged_amd
+
+# Block-based KV cache for efficient serving
+output = flash_attention_paged_amd(
+    q,              # [batch, heads_q, 1, head_dim]
+    k_cache,        # [num_blocks, block_size, heads_kv, head_dim]
+    v_cache,        # [num_blocks, block_size, heads_kv, head_dim]
+    block_tables,   # [batch, max_blocks] int32
+    context_lens,   # [batch] int32
+    window_size=-1  # optional sliding window
+)
+```
 
 ## What's New in 0.4.0
 
@@ -10,16 +73,6 @@ Version: 0.4.0
   - Auto-detects AMD GPUs and routes to optimized kernel
   - Uses `exp2` optimization (faster than `exp` on AMD hardware)
   - Extended autotune configs for 7B/13B/70B/405B models
-
-### MI300X Benchmark Results (vs PyTorch SDPA)
-
-| Config | Speedup |
-|--------|---------|
-| Llama-70B 4K context | **+20.4%** |
-| Llama-70B 8K context | **+19.9%** |
-| Llama-70B batch=4 | **+21.0%** |
-| Long context (32K-128K) | **+17-22%** |
-| Average across all configs | **+15%** |
 
 ## What's New in 0.3.7
 
@@ -29,59 +82,8 @@ Version: 0.4.0
 
 - **PagedAttention (vLLM-style)**: Block-based KV cache for 90% memory savings
 - **7-13x Faster Vulkan**: New fast shader with 32x32 blocks and vec4 loads
-- **Sliding Window Attention**: Efficient local attention with `window_size` parameter
-- **Native FP16/BF16 Compute**: Triton kernels now use native precision (no FP32 conversion overhead)
+- **Native FP16/BF16 Compute**: Triton kernels now use native precision
 - **Multiple Shader Variants**: Choose baseline, fast, fp16, or fp16_amd for your hardware
-- **Long Context Support**: Validated up to 4K+ tokens
-
-### Performance Highlights
-
-| Feature | Improvement |
-|---------|-------------|
-| PagedAttention | 90% memory savings, 7.9K tokens/sec batched |
-| Fast Shader | 7-13x speedup over baseline |
-| Sliding Window (S=1024, W=128) | 7.6x faster (544ms → 71ms) |
-| Triton FP16/BF16 | ~20-30% faster (native compute) |
-
-### New Shader Variants API
-
-```python
-from aule.vulkan import Aule
-
-with Aule() as aule:
-    # Check available variants
-    print(aule.available_shader_variants)  # [0, 1, 2, 3]
-    print(aule.shader_variant_name)  # "fast" (default)
-
-    # Switch variants
-    aule.set_shader_variant(Aule.SHADER_BASELINE)  # 0: Original 16x16
-    aule.set_shader_variant(Aule.SHADER_FAST)      # 1: Optimized 32x32 (default)
-    aule.set_shader_variant(Aule.SHADER_FP16)      # 2: FP16 with FP32 accumulation
-    aule.set_shader_variant(Aule.SHADER_FP16_AMD)  # 3: FP16 for AMD 64-wide wavefronts
-```
-
-### Sliding Window Attention
-
-```python
-# Mistral-style sliding window (only attend to nearby tokens)
-output = aule.attention_gravity(q, k, v, indices, window_size=256)
-
-# Massive speedup for long sequences
-# S=4096, window=512 → ~8x faster than full attention
-```
-
-## What's New in 0.3.3
-
-- **Windows Vulkan Support**: Added Windows DLL - Vulkan backend now works on Windows!
-- **Windows AMD Fix**: Automatic fallback to Vulkan on Windows + AMD (Triton AMD doesn't support Windows)
-
-## What's New in 0.3.0
-
-- **GQA/MQA Support**: Full Grouped Query Attention and Multi-Query Attention for Vulkan backend
-- **Cross-Attention**: Different sequence lengths for Q and K/V tensors
-- **ComfyUI Compatible**: Works with Stable Diffusion, SDXL, Flux, SD3 (use `causal=False`)
-- **20% Faster**: Phase 1 performance optimizations
-- **Bug Fixes**: Tensor cache fix for GQA, blocky noise fix for diffusion models
 
 ## Installation
 
@@ -116,9 +118,10 @@ aule.install()  # Patches PyTorch SDPA globally
 
 ```python
 # 32 query heads, 8 key/value heads (4:1 ratio)
-q = torch.randn(1, 32, 512, 64)
-k = torch.randn(1, 8, 512, 64)
-v = torch.randn(1, 8, 512, 64)
+# Native GQA - no K/V expansion needed!
+q = torch.randn(1, 32, 512, 128, device='cuda')
+k = torch.randn(1, 8, 512, 128, device='cuda')
+v = torch.randn(1, 8, 512, 128, device='cuda')
 
 output = flash_attention(q, k, v, causal=True)
 ```
@@ -131,14 +134,16 @@ output = flash_attention(q, k, v, causal=True)
 - Grouped Query Attention (GQA) and Multi-Query Attention (MQA) support
 - Cross-attention with different Q/KV sequence lengths
 - Sliding window attention for efficient long sequences
+- PagedAttention for vLLM-style serving
 - O(N) memory complexity via FlashAttention-2 algorithm
 
 ## Backends
 
 | Backend | Hardware | Features |
 |---------|----------|----------|
-| Triton | AMD ROCm (Linux), NVIDIA CUDA | Training + Inference, head_dim up to 128 |
-| Vulkan | Any Vulkan 1.2+ GPU (including Windows AMD) | Inference, head_dim up to 64, GQA/MQA, Sliding Window |
+| Triton-AMD | AMD ROCm (Linux) | Training + Inference, GQA, Sliding Window, PagedAttention |
+| Triton | NVIDIA CUDA | Training + Inference, head_dim up to 128 |
+| Vulkan | Any Vulkan 1.2+ GPU | Inference, head_dim up to 64, GQA/MQA |
 | CPU | NumPy | Fallback, any head_dim |
 
 > **Windows + AMD**: Automatically uses Vulkan backend (Triton AMD only supports Linux).
@@ -149,10 +154,10 @@ output = flash_attention(q, k, v, causal=True)
 from aule import flash_attention, get_available_backends, install
 
 # Compute attention
-output = flash_attention(query, key, value, causal=True, scale=None)
+output = flash_attention(query, key, value, causal=True, scale=None, window_size=-1)
 
 # Check available backends
-backends = get_available_backends()  # ['vulkan', 'cpu'] or ['triton', 'vulkan', 'cpu']
+backends = get_available_backends()  # ['triton-amd', 'triton', 'vulkan', 'cpu']
 
 # Install as PyTorch SDPA replacement (for ComfyUI, Transformers, etc.)
 install()  # Auto-select best backend
@@ -181,5 +186,5 @@ MIT License - Aule Technologies
 
 ## Links
 
-- [GitHub Repository](https://github.com/xenn0010/Aule-Attention)
+- [GitHub Repository](https://github.com/AuleTechnologies/Aule-Attention)
 - [PyPI](https://pypi.org/project/aule-attention/)
