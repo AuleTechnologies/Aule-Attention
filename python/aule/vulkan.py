@@ -7,9 +7,13 @@ Works on AMD, NVIDIA, Intel, and any GPU with Vulkan compute support.
 
 import os
 import ctypes
+import logging
 import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple
+
+# Configure logger for the module
+logger = logging.getLogger(__name__)
 
 # Library path (resolved at import time)
 _LIBRARY_PATH: Optional[Path] = None
@@ -55,7 +59,7 @@ def _find_library() -> Path:
 
     for path in candidates:
             if os.path.exists(path):
-                print(f"DEBUG: Loading library from {path}")
+                logger.debug(f"Loading library from {path}")
                 return path
 
     raise RuntimeError(
@@ -710,9 +714,6 @@ class Aule:
         query = np.ascontiguousarray(query, dtype=np.float32)
         key = np.ascontiguousarray(key, dtype=np.float32)
         value = np.ascontiguousarray(value, dtype=np.float32)
-
-        # Allocate output
-        output = np.empty_like(query)
 
         # Allocate output
         output = np.empty_like(query)

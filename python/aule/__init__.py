@@ -20,8 +20,14 @@ Usage:
     out = flash_attention(q, k, v, causal=True)
 """
 
+import logging
+import warnings
+
 __version__ = "0.5.0"
 __author__ = "Aule Technologies"
+
+# Configure logger for the module
+logger = logging.getLogger(__name__)
 
 # Backend availability flags
 _triton_available = False
@@ -30,6 +36,9 @@ _vulkan_available = False
 _cpu_available = True
 _is_amd_gpu = False
 
+# Track backend initialization errors for debugging
+_backend_errors = {}
+
 # Detect AMD GPU
 def _detect_amd_gpu():
     """Detect if running on AMD GPU with ROCm."""
@@ -37,8 +46,8 @@ def _detect_amd_gpu():
         import torch
         if hasattr(torch.version, 'hip') and torch.version.hip is not None:
             return True
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"AMD GPU detection failed: {e}")
     return False
 
 _is_amd_gpu = _detect_amd_gpu()
@@ -50,7 +59,10 @@ if _is_amd_gpu:
         from .triton_flash_amd import flash_attention_paged_amd
         from .triton_flash_amd import get_amd_gpu_arch as _get_amd_gpu_arch
         _triton_amd_available = True
-    except ImportError:
+        logger.debug("AMD Triton backend loaded successfully")
+    except ImportError as e:
+        _backend_errors['triton-amd'] = str(e)
+        logger.debug(f"AMD Triton backend failed to load: {e}")
         flash_attention_paged_amd = None
 
 # Try generic Triton backend (for NVIDIA and fallback)
@@ -63,7 +75,13 @@ try:
         apply_rope_separate,
     )
     _triton_available = is_triton_available()
-except ImportError:
+    if _triton_available:
+        logger.debug("Generic Triton backend loaded successfully")
+    else:
+        _backend_errors['triton'] = "Triton not available on this system"
+except ImportError as e:
+    _backend_errors['triton'] = str(e)
+    logger.debug(f"Generic Triton backend failed to load: {e}")
     flash_attention_rope = None
     precompute_rope_frequencies = None
     apply_rope_separate = None
@@ -72,16 +90,18 @@ except ImportError:
 try:
     from .vulkan import Aule, GpuTensor, attention as vulkan_attention, AuleError
     _vulkan_available = True
-except Exception:
-    pass
+    logger.debug("Vulkan backend loaded successfully")
+except Exception as e:
+    _backend_errors['vulkan'] = str(e)
+    logger.debug(f"Vulkan backend failed to load: {e}")
 
 try:
     from .patching import patch_model
-except ImportError:
-    pass
+except ImportError as e:
+    logger.debug(f"Patching module failed to load: {e}")
 
 
-def flash_attention(query, key, value, rot_cos=None, rot_sin=None, causal=True, scale=None):
+def flash_attention(query, key, value, rot_cos=None, rot_sin=None, causal=True, scale=None, window_size=-1):
     """
     FlashAttention-2 implementation.
 
@@ -91,14 +111,20 @@ def flash_attention(query, key, value, rot_cos=None, rot_sin=None, causal=True, 
     - CPU: Fallback
 
     Args:
-        query: [batch, heads, seq_len_q, head_dim] - torch.Tensor or numpy.ndarray
-        key: [batch, heads, seq_len_k, head_dim]
-        value: [batch, heads, seq_len_k, head_dim]
+        query: [batch, heads_q, seq_len_q, head_dim] - torch.Tensor or numpy.ndarray
+        key: [batch, heads_kv, seq_len_k, head_dim]
+        value: [batch, heads_kv, seq_len_k, head_dim]
+        rot_cos: Optional RoPE cos values [seq_len, head_dim//2]
+        rot_sin: Optional RoPE sin values [seq_len, head_dim//2]
         causal: Apply causal masking (default True for LLMs)
         scale: Attention scale (default 1/sqrt(head_dim))
+        window_size: Sliding window size (-1 for full attention)
 
     Returns:
         Output tensor with same shape as query
+
+    Raises:
+        ValueError: If input shapes are invalid
     """
     import numpy as np
 
@@ -109,6 +135,29 @@ def flash_attention(query, key, value, rot_cos=None, rot_sin=None, causal=True, 
         is_torch = isinstance(query, torch.Tensor)
     except ImportError:
         pass
+
+    # Input validation
+    if query.ndim != 4:
+        raise ValueError(f"query must be 4D [batch, heads, seq_len, head_dim], got shape {query.shape}")
+    if key.ndim != 4:
+        raise ValueError(f"key must be 4D [batch, heads, seq_len, head_dim], got shape {key.shape}")
+    if value.ndim != 4:
+        raise ValueError(f"value must be 4D [batch, heads, seq_len, head_dim], got shape {value.shape}")
+
+    batch_q, heads_q, seq_q, head_dim_q = query.shape
+    batch_k, heads_kv, seq_k, head_dim_k = key.shape
+    batch_v, heads_v, seq_v, head_dim_v = value.shape
+
+    if batch_q != batch_k or batch_q != batch_v:
+        raise ValueError(f"Batch size mismatch: query={batch_q}, key={batch_k}, value={batch_v}")
+    if head_dim_q != head_dim_k or head_dim_q != head_dim_v:
+        raise ValueError(f"head_dim mismatch: query={head_dim_q}, key={head_dim_k}, value={head_dim_v}")
+    if seq_k != seq_v:
+        raise ValueError(f"Key/value seq_len mismatch: key={seq_k}, value={seq_v}")
+    if heads_kv != heads_v:
+        raise ValueError(f"Key/value heads mismatch: key={heads_kv}, value={heads_v}")
+    if heads_q % heads_kv != 0:
+        raise ValueError(f"heads_q ({heads_q}) must be divisible by heads_kv ({heads_kv}) for GQA")
 
     # Determine which backend to use
     use_triton = False
@@ -152,10 +201,10 @@ def flash_attention(query, key, value, rot_cos=None, rot_sin=None, causal=True, 
             # Use AMD-optimized kernel on AMD GPUs for maximum performance
             if _triton_amd_available and _is_amd_gpu:
                 from .triton_flash_amd import flash_attention_amd
-                return flash_attention_amd(query, key, value, causal=causal, scale=scale)
+                return flash_attention_amd(query, key, value, causal=causal, scale=scale, window_size=window_size)
             else:
                 from .triton_flash import flash_attention_triton
-                return flash_attention_triton(query, key, value, causal=causal, scale=scale)
+                return flash_attention_triton(query, key, value, causal=causal, scale=scale, window_size=window_size)
 
         if use_vulkan:
             q_np = query.cpu().numpy()
@@ -164,15 +213,18 @@ def flash_attention(query, key, value, rot_cos=None, rot_sin=None, causal=True, 
 
             # RoPE not yet supported in Vulkan backend
             if rot_cos is not None or rot_sin is not None:
-                import warnings
-                warnings.warn("RoPE not yet supported in Vulkan backend, ignoring rot_cos/rot_sin")
+                warnings.warn("RoPE not yet supported in Vulkan backend, ignoring rot_cos/rot_sin", stacklevel=2)
+            if window_size > 0:
+                warnings.warn("Sliding window not yet supported in Vulkan backend, using full attention", stacklevel=2)
 
             out_np = vulkan_attention(q_np, k_np, v_np, causal=causal)
             return torch.from_numpy(out_np).to(query.device)
 
         # CPU fallback
         if rot_cos is not None:
-             print("Warning: RoPE not supported on CPU fallback yet")
+            warnings.warn("RoPE not supported on CPU fallback yet", stacklevel=2)
+        if window_size > 0:
+            warnings.warn("Sliding window not supported on CPU fallback, using full attention", stacklevel=2)
         out_np = _cpu_attention(query.cpu().numpy(), key.cpu().numpy(), value.cpu().numpy(), causal)
         return torch.from_numpy(out_np).to(query.device)
 
@@ -181,11 +233,14 @@ def flash_attention(query, key, value, rot_cos=None, rot_sin=None, causal=True, 
         if use_vulkan:
             # RoPE not yet supported in Vulkan backend
             if rot_cos is not None or rot_sin is not None:
-                import warnings
-                warnings.warn("RoPE not yet supported in Vulkan backend, ignoring rot_cos/rot_sin")
+                warnings.warn("RoPE not yet supported in Vulkan backend, ignoring rot_cos/rot_sin", stacklevel=2)
+            if window_size > 0:
+                warnings.warn("Sliding window not yet supported in Vulkan backend, using full attention", stacklevel=2)
             return vulkan_attention(query, key, value, causal=causal)
         if rot_cos is not None:
-             print("Warning: RoPE not supported on CPU fallback yet")
+            warnings.warn("RoPE not supported on CPU fallback yet", stacklevel=2)
+        if window_size > 0:
+            warnings.warn("Sliding window not supported on CPU fallback, using full attention", stacklevel=2)
         return _cpu_attention(query, key, value, causal)
 
 
@@ -401,6 +456,21 @@ def get_available_backends():
     return backends
 
 
+def get_backend_errors():
+    """
+    Return dict of backend initialization errors for debugging.
+
+    Useful when a backend you expect to work isn't available.
+
+    Example:
+        >>> import aule
+        >>> errors = aule.get_backend_errors()
+        >>> print(errors)
+        {'vulkan': "Could not find aule library..."}
+    """
+    return dict(_backend_errors)
+
+
 def get_backend_info():
     """Return detailed backend information."""
     info = {}
@@ -508,6 +578,7 @@ __all__ = [
     "uninstall",
     # Backend info
     "get_available_backends",
+    "get_backend_errors",
     "get_backend_info",
     "print_backend_info",
     # Vulkan extras (if available)

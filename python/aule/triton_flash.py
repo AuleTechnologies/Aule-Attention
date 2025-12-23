@@ -81,6 +81,9 @@ def _flash_attn_fwd_kernel(
     USE_ROPE: tl.constexpr,  # Whether to apply RoPE
 ):
     """FlashAttention-2 forward kernel with GQA, sliding window, and fused RoPE support."""
+    # Use large negative instead of -inf to avoid -inf - (-inf) = nan
+    NEG_INF: tl.constexpr = -1e20
+
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
 
@@ -101,7 +104,7 @@ def _flash_attn_fwd_kernel(
 
     # Initialize accumulators
     acc = tl.zeros([BLOCK_M, BLOCK_K], dtype=tl.float32)
-    m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
+    m_i = tl.full([BLOCK_M], NEG_INF, dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
 
     # Load Q
@@ -182,27 +185,39 @@ def _flash_attn_fwd_kernel(
         # Causal mask
         if IS_CAUSAL:
             causal_mask = offs_m[:, None] >= offs_n_curr[None, :]
-            s = tl.where(causal_mask, s, float('-inf'))
+            s = tl.where(causal_mask, s, NEG_INF)
 
         # Sliding window mask
         if window_size > 0:
             window_mask = (offs_m[:, None] - offs_n_curr[None, :]) <= window_size
             if not IS_CAUSAL:
                 window_mask = window_mask & ((offs_n_curr[None, :] - offs_m[:, None]) <= window_size)
-            s = tl.where(window_mask, s, float('-inf'))
+            s = tl.where(window_mask, s, NEG_INF)
 
         # Bounds mask
-        s = tl.where(offs_n_curr[None, :] < seq_len_k, s, float('-inf'))
+        s = tl.where(offs_n_curr[None, :] < seq_len_k, s, NEG_INF)
 
-        # Online softmax
+        # Online softmax with NaN protection
         m_ij = tl.max(s, axis=1)
-        m_new = tl.maximum(m_i, m_ij)
+
+        # Handle rows where all positions are masked
+        row_has_valid = m_ij > (NEG_INF + 1.0)
+        m_ij_safe = tl.where(row_has_valid, m_ij, 0.0)
+        m_new = tl.where(row_has_valid, tl.maximum(m_i, m_ij_safe), m_i)
+
         alpha = tl.exp(m_i - m_new)
-        beta = tl.exp(m_ij - m_new)
-        l_i = l_i * alpha + tl.sum(tl.exp(s - m_ij[:, None]) * beta[:, None], axis=1)
+        # Clamp alpha when m_i is still initial NEG_INF
+        alpha = tl.where(m_i > NEG_INF, alpha, 0.0)
+
         p = tl.exp(s - m_new[:, None])
+        # Zero out invalid rows
+        p = tl.where(row_has_valid[:, None], p, 0.0)
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-        m_i = m_new
+
+        # Only update m_i for rows with valid entries
+        m_i = tl.where(row_has_valid, m_new, m_i)
 
     # Normalize
     acc = acc / l_i[:, None]
@@ -241,6 +256,9 @@ def _flash_attn_bwd_kernel(
     IS_CAUSAL: tl.constexpr,
 ):
     """FlashAttention-2 backward kernel."""
+    # Use large negative instead of -inf to avoid numerical issues
+    NEG_INF: tl.constexpr = -1e20
+
     pid_n = tl.program_id(0)  # KV block
     pid_bh = tl.program_id(1)
 
@@ -297,8 +315,8 @@ def _flash_attn_bwd_kernel(
 
         if IS_CAUSAL:
             causal_mask = offs_m_curr[:, None] >= offs_n[None, :]
-            s = tl.where(causal_mask, s, float('-inf'))
-        s = tl.where(offs_n[None, :] < seq_len_k, s, float('-inf'))
+            s = tl.where(causal_mask, s, NEG_INF)
+        s = tl.where(offs_n[None, :] < seq_len_k, s, NEG_INF)
 
         p = tl.exp(s - lse[:, None])
 
