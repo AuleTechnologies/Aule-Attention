@@ -35,11 +35,18 @@ _triton_amd_available = False
 _vulkan_available = False
 _cpu_available = True
 _is_amd_gpu = False
+_is_datacenter_gpu = False
+_detected_gpu_type = None  # 'datacenter', 'consumer', or None
+_hardware_optimized = False
 
 # Track backend initialization errors for debugging
 _backend_errors = {}
 
-# Detect AMD GPU
+
+# =============================================================================
+# GPU DETECTION FUNCTIONS
+# =============================================================================
+
 def _detect_amd_gpu():
     """Detect if running on AMD GPU with ROCm."""
     try:
@@ -49,6 +56,223 @@ def _detect_amd_gpu():
     except Exception as e:
         logger.debug(f"AMD GPU detection failed: {e}")
     return False
+
+
+def _detect_gpu_type():
+    """
+    Detect GPU type and return classification.
+
+    Returns:
+        tuple: (is_datacenter, gpu_type_str, gpu_name)
+            - is_datacenter: True for datacenter GPUs (MI300X, MI250, A100, H100, etc.)
+            - gpu_type_str: 'datacenter', 'consumer', or 'unknown'
+            - gpu_name: Human-readable GPU name
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False, 'unknown', 'No CUDA device'
+
+        props = torch.cuda.get_device_properties(0)
+        gpu_name = props.name.lower()
+
+        # AMD Datacenter GPUs (MI series - Instinct)
+        amd_datacenter_patterns = [
+            'mi300', 'mi250', 'mi210', 'mi200', 'mi100', 'mi60', 'mi50',
+            'instinct',  # AMD Instinct series
+        ]
+
+        # AMD Consumer GPUs (Radeon RX series)
+        amd_consumer_patterns = [
+            'rx 7', 'rx 6', 'rx 5', 'radeon',
+            'gfx11', 'gfx10',  # RDNA architecture IDs
+            'navi',  # RDNA codenames
+        ]
+
+        # NVIDIA Datacenter GPUs
+        nvidia_datacenter_patterns = [
+            'a100', 'a800', 'h100', 'h200', 'h800',
+            'a30', 'a40', 'a10', 'a16',
+            'v100', 'p100', 't4',
+            'l40', 'l4',
+            'b100', 'b200',  # Blackwell
+            'dgx', 'hgx',  # NVIDIA HPC systems
+        ]
+
+        # NVIDIA Consumer GPUs
+        nvidia_consumer_patterns = [
+            'geforce', 'rtx 20', 'rtx 30', 'rtx 40', 'rtx 50',
+            'gtx', 'titan',
+            'quadro',  # Some Quadro might be prosumer
+        ]
+
+        # Check AMD datacenter first
+        for pattern in amd_datacenter_patterns:
+            if pattern in gpu_name:
+                return True, 'datacenter', props.name
+
+        # Check NVIDIA datacenter
+        for pattern in nvidia_datacenter_patterns:
+            if pattern in gpu_name:
+                return True, 'datacenter', props.name
+
+        # Check AMD consumer
+        for pattern in amd_consumer_patterns:
+            if pattern in gpu_name:
+                return False, 'consumer', props.name
+
+        # Check NVIDIA consumer
+        for pattern in nvidia_consumer_patterns:
+            if pattern in gpu_name:
+                return False, 'consumer', props.name
+
+        # Heuristic: high memory bandwidth often indicates datacenter GPU
+        # MI300X: ~5.3 TB/s, A100: ~2 TB/s, Consumer: <1 TB/s typically
+        # Use compute capability as another hint
+        major, minor = props.major, props.minor
+        total_memory_gb = props.total_memory / (1024**3)
+
+        # High memory (>40GB) usually means datacenter
+        if total_memory_gb > 40:
+            return True, 'datacenter', props.name
+
+        return False, 'unknown', props.name
+
+    except Exception as e:
+        logger.debug(f"GPU type detection failed: {e}")
+        return False, 'unknown', 'Detection failed'
+
+
+def _get_optimal_backend():
+    """
+    Determine the optimal backend for the detected hardware.
+
+    Returns:
+        str: 'triton', 'triton-amd', 'vulkan', or 'cpu'
+    """
+    global _is_datacenter_gpu, _detected_gpu_type
+
+    is_datacenter, gpu_type, gpu_name = _detect_gpu_type()
+    _is_datacenter_gpu = is_datacenter
+    _detected_gpu_type = gpu_type
+
+    if is_datacenter:
+        # Datacenter GPUs should always prefer Triton for best performance
+        if _is_amd_gpu and _triton_amd_available:
+            logger.info(f"Datacenter GPU detected ({gpu_name}): Using AMD-optimized Triton backend")
+            return 'triton-amd'
+        elif _triton_available:
+            logger.info(f"Datacenter GPU detected ({gpu_name}): Using Triton backend")
+            return 'triton'
+        elif _vulkan_available:
+            # Fallback - shouldn't happen on properly configured datacenter
+            logger.warning(
+                f"Datacenter GPU detected ({gpu_name}) but Triton not available. "
+                "Falling back to Vulkan. For optimal performance, install Triton: pip install triton"
+            )
+            return 'vulkan'
+    else:
+        # Consumer GPUs - auto-select based on availability
+        if _is_amd_gpu and _triton_amd_available:
+            return 'triton-amd'
+        elif _triton_available:
+            return 'triton'
+        elif _vulkan_available:
+            return 'vulkan'
+
+    return 'cpu'
+
+
+def is_datacenter_gpu():
+    """
+    Check if running on a datacenter GPU.
+
+    Datacenter GPUs include:
+    - AMD: MI300X, MI250, MI200, MI100, Instinct series
+    - NVIDIA: A100, H100, H200, V100, T4, L40, etc.
+
+    Returns:
+        bool: True if running on datacenter GPU
+    """
+    global _is_datacenter_gpu, _detected_gpu_type
+    if _detected_gpu_type is None:
+        _is_datacenter_gpu, _detected_gpu_type, _ = _detect_gpu_type()
+    return _is_datacenter_gpu
+
+
+def get_gpu_info():
+    """
+    Get detailed information about the detected GPU.
+
+    Returns:
+        dict: GPU information including type, name, and recommended backend
+    """
+    is_datacenter, gpu_type, gpu_name = _detect_gpu_type()
+    optimal_backend = _get_optimal_backend()
+
+    return {
+        'name': gpu_name,
+        'type': gpu_type,
+        'is_datacenter': is_datacenter,
+        'is_amd': _is_amd_gpu,
+        'recommended_backend': optimal_backend,
+        'triton_available': _triton_available,
+        'triton_amd_available': _triton_amd_available,
+        'vulkan_available': _vulkan_available,
+    }
+
+
+def optimize_for_hardware(verbose=True):
+    """
+    Optimize aule-attention for the detected hardware.
+
+    This function should be called during initialization to ensure
+    the best backend is selected for datacenter GPUs. It will:
+
+    1. Detect the GPU type (datacenter vs consumer)
+    2. Select the optimal backend (Triton for datacenter, auto for consumer)
+    3. Warm up the selected backend for faster first inference
+
+    For datacenter GPUs (MI300X, A100, H100, etc.), this ensures
+    Triton is used instead of Vulkan for maximum performance.
+
+    Args:
+        verbose: If True, print hardware detection and backend info
+
+    Returns:
+        dict: Hardware info and selected backend
+
+    Example:
+        import aule
+        info = aule.optimize_for_hardware()
+        # {'name': 'AMD Instinct MI300X', 'type': 'datacenter',
+        #  'recommended_backend': 'triton-amd', ...}
+    """
+    global _hardware_optimized, _forced_backend
+
+    info = get_gpu_info()
+
+    if verbose:
+        print(f"aule-attention: Hardware optimization")
+        print(f"  GPU: {info['name']}")
+        print(f"  Type: {info['type']}")
+        print(f"  Backend: {info['recommended_backend']}")
+
+    # For datacenter GPUs, force the optimal backend
+    if info['is_datacenter']:
+        if info['recommended_backend'] in ('triton', 'triton-amd'):
+            # Don't override if already forced
+            if _forced_backend is None:
+                _forced_backend = 'triton'
+                if verbose:
+                    print(f"  Status: Datacenter GPU detected, forcing Triton backend")
+        elif info['recommended_backend'] == 'vulkan' and verbose:
+            print(f"  Warning: Triton not available, using Vulkan (suboptimal for datacenter)")
+
+    _hardware_optimized = True
+
+    return info
+
 
 _is_amd_gpu = _detect_amd_gpu()
 
@@ -166,7 +390,7 @@ def flash_attention(query, key, value, rot_cos=None, rot_sin=None, causal=True, 
     backend_name = None
 
     if _forced_backend == 'triton':
-        if _triton_available:
+        if _triton_available or _triton_amd_available:
             use_triton = True
             backend_name = 'triton (forced)'
         else:
@@ -181,10 +405,41 @@ def flash_attention(query, key, value, rot_cos=None, rot_sin=None, causal=True, 
         use_cpu = True
         backend_name = 'cpu (forced)'
     else:
-        # Auto-select
-        if is_torch and _triton_available and query.is_cuda:
-            use_triton = True
-            backend_name = 'triton'
+        # Auto-select with datacenter GPU optimization
+        # For datacenter GPUs, strongly prefer Triton over Vulkan
+        is_dc = is_datacenter_gpu()
+
+        if is_torch and query.is_cuda:
+            # GPU tensor - prefer Triton, especially for datacenter
+            if _triton_amd_available and _is_amd_gpu:
+                use_triton = True
+                backend_name = 'triton-amd' + (' (datacenter)' if is_dc else '')
+            elif _triton_available:
+                use_triton = True
+                backend_name = 'triton' + (' (datacenter)' if is_dc else '')
+            elif _vulkan_available:
+                use_vulkan = True
+                backend_name = 'vulkan'
+                # Warn for datacenter GPUs using suboptimal Vulkan
+                if is_dc:
+                    logger.warning(
+                        "Datacenter GPU detected but using Vulkan backend (suboptimal). "
+                        "Install Triton for best performance: pip install triton"
+                    )
+            else:
+                use_cpu = True
+                backend_name = 'cpu'
+        elif is_torch and not query.is_cuda:
+            # CPU tensor in PyTorch - check if we should move to GPU
+            if is_dc and (_triton_available or _triton_amd_available):
+                # Datacenter: suggest moving to GPU
+                logger.debug("CPU tensor on datacenter GPU - consider using .cuda() for best performance")
+            if _vulkan_available:
+                use_vulkan = True
+                backend_name = 'vulkan'
+            else:
+                use_cpu = True
+                backend_name = 'cpu'
         elif _vulkan_available:
             use_vulkan = True
             backend_name = 'vulkan'
@@ -350,12 +605,15 @@ def scaled_dot_product_attention(
     return flash_attention(query, key, value, causal=is_causal, scale=scale)
 
 
-def install(backend=None, verbose=False):
+def install(backend=None, verbose=False, auto_optimize=True):
     """
     Install aule-attention as the default PyTorch attention backend.
 
     After calling this, all models using torch.nn.functional.scaled_dot_product_attention
     will automatically use aule-attention (Triton on ROCm/CUDA, Vulkan on consumer GPUs).
+
+    For datacenter GPUs (MI300X, A100, H100, etc.), this automatically optimizes
+    the backend selection to use Triton for best performance.
 
     Args:
         backend: Force a specific backend. Options:
@@ -364,14 +622,19 @@ def install(backend=None, verbose=False):
                  - 'vulkan': Force Vulkan backend
                  - 'cpu': Force CPU/NumPy backend
         verbose: If True, print which backend is used for each attention call
+        auto_optimize: If True (default), automatically detect datacenter GPUs
+                      and optimize backend selection for best performance
 
     Usage:
         import aule
-        aule.install()  # Auto-select
+        aule.install()  # Auto-select with datacenter optimization
 
         # Or force a specific backend:
         aule.install(backend='vulkan')
         aule.install(backend='triton', verbose=True)
+
+        # Disable auto-optimization:
+        aule.install(auto_optimize=False)
 
     Works with:
         - ComfyUI (Stable Diffusion, SDXL, Flux, SD3)
@@ -394,6 +657,20 @@ def install(backend=None, verbose=False):
         print(f"aule-attention: Updated (backend={backend or 'auto'}, verbose={verbose})")
         return
 
+    # Auto-optimize for datacenter GPUs if enabled and no explicit backend set
+    if auto_optimize and backend is None:
+        gpu_info = get_gpu_info()
+        if gpu_info['is_datacenter']:
+            # Datacenter GPU detected - ensure Triton is used
+            if gpu_info['triton_available'] or gpu_info['triton_amd_available']:
+                backend = 'triton'
+                logger.info(f"Datacenter GPU ({gpu_info['name']}) detected, using Triton backend")
+            else:
+                logger.warning(
+                    f"Datacenter GPU ({gpu_info['name']}) detected but Triton not available. "
+                    "Install Triton for best performance: pip install triton"
+                )
+
     # Save original for fallback
     _original_sdpa = F.scaled_dot_product_attention
 
@@ -410,7 +687,9 @@ def install(backend=None, verbose=False):
         backend_name = backend.capitalize()
     else:
         backends = get_available_backends()
-        if 'triton' in backends:
+        if 'triton-amd' in backends:
+            backend_name = "auto: Triton-AMD"
+        elif 'triton' in backends:
             backend_name = "auto: Triton"
         elif 'vulkan' in backends:
             backend_name = "auto: Vulkan"
@@ -520,6 +799,13 @@ def print_backend_info():
     print("=" * 60)
     print()
 
+    # Show GPU type detection
+    gpu_info = get_gpu_info()
+    print(f"GPU: {gpu_info['name']}")
+    print(f"Type: {gpu_info['type'].upper()}" + (" (optimized for Triton)" if gpu_info['is_datacenter'] else ""))
+    print(f"Recommended backend: {gpu_info['recommended_backend']}")
+    print()
+
     backends = get_available_backends()
     print(f"Available backends: {backends}")
     print()
@@ -528,7 +814,9 @@ def print_backend_info():
     if _triton_amd_available:
         import torch
         arch = _get_amd_gpu_arch()
-        print(f"[{idx}] TRITON-AMD (primary)")
+        is_recommended = gpu_info['recommended_backend'] == 'triton-amd'
+        marker = " (recommended)" if is_recommended else ""
+        print(f"[{idx}] TRITON-AMD{marker}")
         print(f"    GPU: {torch.cuda.get_device_name(0)}")
         print(f"    Architecture: {arch}")
         print("    Status: AMD-optimized FlashAttention-2 (MI300X tuned)")
@@ -537,7 +825,9 @@ def print_backend_info():
 
     if _triton_available:
         import torch
-        print(f"[{idx}] TRITON")
+        is_recommended = gpu_info['recommended_backend'] == 'triton'
+        marker = " (recommended)" if is_recommended else ""
+        print(f"[{idx}] TRITON{marker}")
         print(f"    GPU: {torch.cuda.get_device_name(0)}")
         print("    Status: Generic FlashAttention-2 kernel")
         print()
@@ -546,10 +836,14 @@ def print_backend_info():
     if _vulkan_available:
         try:
             with Aule() as aule:
-                info = aule.get_device_info()
-                print(f"[{idx}] VULKAN")
-                print(f"    GPU: {info.get('device_name', 'Unknown')}")
+                dev_info = aule.get_device_info()
+                is_suboptimal = gpu_info['is_datacenter'] and gpu_info['recommended_backend'] == 'vulkan'
+                marker = " (suboptimal for datacenter)" if is_suboptimal else ""
+                print(f"[{idx}] VULKAN{marker}")
+                print(f"    GPU: {dev_info.get('device_name', 'Unknown')}")
                 print("    Status: Vulkan compute shader")
+                if is_suboptimal:
+                    print("    Warning: Install Triton for better datacenter performance")
                 print()
                 idx += 1
         except:
@@ -558,6 +852,13 @@ def print_backend_info():
     print(f"[{idx}] CPU")
     print("    Status: NumPy fallback")
     print()
+
+    # Summary recommendation for datacenter
+    if gpu_info['is_datacenter'] and gpu_info['recommended_backend'] == 'vulkan':
+        print("RECOMMENDATION: Datacenter GPU detected but Triton not available.")
+        print("For optimal performance, install Triton: pip install triton")
+        print()
+
     print("=" * 60)
 
 
@@ -576,6 +877,10 @@ __all__ = [
     # Installation (for ComfyUI, etc.)
     "install",
     "uninstall",
+    # Hardware detection & optimization
+    "optimize_for_hardware",
+    "is_datacenter_gpu",
+    "get_gpu_info",
     # Backend info
     "get_available_backends",
     "get_backend_errors",
