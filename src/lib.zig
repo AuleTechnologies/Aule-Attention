@@ -45,6 +45,11 @@ const attention_f16_amd_spv = @embedFile("attention_f16_amd_spv");
 // Optimized FP32 shader (vectorized loads, block skipping)
 const attention_f32_fast_spv = @embedFile("attention_f32_fast_spv");
 
+// Cooperative Matrix & Tiled Shaders
+const attention_coopmat_khr_spv = @embedFile("attention_coopmat_khr_spv");
+const attention_tiled_fp32_spv = @embedFile("attention_tiled_fp32_spv");
+const attention_coopmat_backward_spv = @embedFile("attention_coopmat_backward_spv");
+
 // Paged attention shader (PagedAttention with block pool)
 const attention_paged_spv = @embedFile("attention_paged_spv");
 const copy_kv_to_paged_spv = @embedFile("copy_kv_to_paged_spv");
@@ -79,6 +84,8 @@ export fn aule_init() callconv(.C) i32 {
         attention_f32_fast_spv, // Optimized FP32 shader
         attention_f16_spv, // FP16 shader
         attention_f16_amd_spv, // FP16 AMD-optimized
+        attention_coopmat_khr_spv, // Cooperative Matrix KHR shader
+        attention_tiled_fp32_spv, // Tiled FP32 shader
         attention_paged_spv, // PagedAttention shader
         copy_kv_to_paged_spv, // K/V copy shader for paged attention
     ) catch |err| {
@@ -232,6 +239,8 @@ export fn aule_has_shader_variant(variant: u8) callconv(.C) i32 {
                 .fast => if (engine.fast_pipeline != null) @as(i32, 1) else 0,
                 .fp16 => if (engine.fp16_pipeline != null) @as(i32, 1) else 0,
                 .fp16_amd => if (engine.fp16_amd_pipeline != null) @as(i32, 1) else 0,
+                .coopmat_tiled_fp32 => if (engine.coopmat_tiled_fp32_pipeline != null) @as(i32, 1) else 0,
+                .coopmat_khr => if (engine.coopmat_khr_pipeline != null) @as(i32, 1) else 0,
             };
         }
     }
@@ -329,30 +338,63 @@ export fn aule_attention_forward(
     const count = batch_size * num_heads * seq_len * head_dim;
 
     // 1. Create tensors
-    const q_tensor = ctx.createTensor(shape) catch |err| { setError("Create Q failed: {}", .{err}); return -2; };
+    const q_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create Q failed: {}", .{err});
+        return -2;
+    };
     const q_ptr = global_allocator.create(Tensor) catch return -2;
     q_ptr.* = q_tensor;
-    defer { ctx.destroyTensor(q_ptr); global_allocator.destroy(q_ptr); }
+    defer {
+        ctx.destroyTensor(q_ptr);
+        global_allocator.destroy(q_ptr);
+    }
 
-    const k_tensor = ctx.createTensor(shape) catch |err| { setError("Create K failed: {}", .{err}); return -2; };
+    const k_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create K failed: {}", .{err});
+        return -2;
+    };
     const k_ptr = global_allocator.create(Tensor) catch return -2;
     k_ptr.* = k_tensor;
-    defer { ctx.destroyTensor(k_ptr); global_allocator.destroy(k_ptr); }
+    defer {
+        ctx.destroyTensor(k_ptr);
+        global_allocator.destroy(k_ptr);
+    }
 
-    const v_tensor = ctx.createTensor(shape) catch |err| { setError("Create V failed: {}", .{err}); return -2; };
+    const v_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create V failed: {}", .{err});
+        return -2;
+    };
     const v_ptr = global_allocator.create(Tensor) catch return -2;
     v_ptr.* = v_tensor;
-    defer { ctx.destroyTensor(v_ptr); global_allocator.destroy(v_ptr); }
+    defer {
+        ctx.destroyTensor(v_ptr);
+        global_allocator.destroy(v_ptr);
+    }
 
-    const o_tensor = ctx.createTensor(shape) catch |err| { setError("Create Output failed: {}", .{err}); return -2; };
+    const o_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create Output failed: {}", .{err});
+        return -2;
+    };
     const o_ptr = global_allocator.create(Tensor) catch return -2;
     o_ptr.* = o_tensor;
-    defer { ctx.destroyTensor(o_ptr); global_allocator.destroy(o_ptr); }
+    defer {
+        ctx.destroyTensor(o_ptr);
+        global_allocator.destroy(o_ptr);
+    }
 
     // 2. Upload data
-    ctx.upload(q_ptr, query[0..count]) catch |err| { setError("Upload Q failed: {}", .{err}); return -3; };
-    ctx.upload(k_ptr, key[0..count]) catch |err| { setError("Upload K failed: {}", .{err}); return -3; };
-    ctx.upload(v_ptr, value[0..count]) catch |err| { setError("Upload V failed: {}", .{err}); return -3; };
+    ctx.upload(q_ptr, query[0..count]) catch |err| {
+        setError("Upload Q failed: {}", .{err});
+        return -3;
+    };
+    ctx.upload(k_ptr, key[0..count]) catch |err| {
+        setError("Upload K failed: {}", .{err});
+        return -3;
+    };
+    ctx.upload(v_ptr, value[0..count]) catch |err| {
+        setError("Upload V failed: {}", .{err});
+        return -3;
+    };
 
     // 3. Compute (no sliding window for basic API)
     ctx.attention(q_ptr, k_ptr, v_ptr, o_ptr, null, null, causal != 0, -1) catch |err| {
@@ -361,7 +403,10 @@ export fn aule_attention_forward(
     };
 
     // 4. Download
-    ctx.download(o_ptr, output[0..count]) catch |err| { setError("Download failed: {}", .{err}); return -5; };
+    ctx.download(o_ptr, output[0..count]) catch |err| {
+        setError("Download failed: {}", .{err});
+        return -5;
+    };
 
     return 0;
 }
@@ -413,8 +458,14 @@ export fn aule_tensor_create(
     head_dim: u32,
 ) callconv(.C) TensorHandle {
     // std.debug.print("aule_tensor_create: called\n", .{});
-    var ctx = global_ctx orelse { setError("Not initialized", .{}); return 0; };
-    const slot_idx = allocTensorSlot() orelse { setError("Max tensors reached", .{}); return 0; };
+    var ctx = global_ctx orelse {
+        setError("Not initialized", .{});
+        return 0;
+    };
+    const slot_idx = allocTensorSlot() orelse {
+        setError("Max tensors reached", .{});
+        return 0;
+    };
 
     const shape = [4]u32{ batch_size, num_heads, seq_len, head_dim };
     const tensor = ctx.createTensor(shape) catch |err| {
@@ -435,7 +486,7 @@ export fn aule_tensor_create_u32(
     seq_len: u32,
     head_dim: u32,
 ) callconv(.C) TensorHandle {
-    // For now, backend only supports f32 tensors explicitly, 
+    // For now, backend only supports f32 tensors explicitly,
     // but GpuTensor doesn't distinguish sizes for 32-bit types.
     // We treat it as f32 for storage but expose as u32 for API.
     return aule_tensor_create(batch_size, num_heads, seq_len, head_dim);
@@ -485,7 +536,7 @@ export fn aule_tensor_download_u32(handle: TensorHandle, output: [*]u32, count: 
 
     // Cast u32 buffer to f32 buffer for backend call (both are 32-bit)
     const out_f32 = @as([*]f32, @ptrCast(output));
-    
+
     ctx.download(tensor, out_f32[0..count]) catch |err| {
         setError("Download u32 failed: {}", .{err});
         return -3;
@@ -674,67 +725,148 @@ export fn aule_attention_backward(
     const lse_count = batch_size * num_heads * seq_len;
 
     // Create tensors for inputs
-    const q_tensor = ctx.createTensor(shape) catch |err| { setError("Create Q failed: {}", .{err}); return -2; };
+    const q_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create Q failed: {}", .{err});
+        return -2;
+    };
     const q_ptr = global_allocator.create(Tensor) catch return -2;
     q_ptr.* = q_tensor;
-    defer { ctx.destroyTensor(q_ptr); global_allocator.destroy(q_ptr); }
+    defer {
+        ctx.destroyTensor(q_ptr);
+        global_allocator.destroy(q_ptr);
+    }
 
-    const k_tensor = ctx.createTensor(shape) catch |err| { setError("Create K failed: {}", .{err}); return -2; };
+    const k_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create K failed: {}", .{err});
+        return -2;
+    };
     const k_ptr = global_allocator.create(Tensor) catch return -2;
     k_ptr.* = k_tensor;
-    defer { ctx.destroyTensor(k_ptr); global_allocator.destroy(k_ptr); }
+    defer {
+        ctx.destroyTensor(k_ptr);
+        global_allocator.destroy(k_ptr);
+    }
 
-    const v_tensor = ctx.createTensor(shape) catch |err| { setError("Create V failed: {}", .{err}); return -2; };
+    const v_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create V failed: {}", .{err});
+        return -2;
+    };
     const v_ptr = global_allocator.create(Tensor) catch return -2;
     v_ptr.* = v_tensor;
-    defer { ctx.destroyTensor(v_ptr); global_allocator.destroy(v_ptr); }
+    defer {
+        ctx.destroyTensor(v_ptr);
+        global_allocator.destroy(v_ptr);
+    }
 
-    const o_tensor = ctx.createTensor(shape) catch |err| { setError("Create O failed: {}", .{err}); return -2; };
+    const o_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create O failed: {}", .{err});
+        return -2;
+    };
     const o_ptr = global_allocator.create(Tensor) catch return -2;
     o_ptr.* = o_tensor;
-    defer { ctx.destroyTensor(o_ptr); global_allocator.destroy(o_ptr); }
+    defer {
+        ctx.destroyTensor(o_ptr);
+        global_allocator.destroy(o_ptr);
+    }
 
-    const do_tensor = ctx.createTensor(shape) catch |err| { setError("Create dO failed: {}", .{err}); return -2; };
+    const do_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create dO failed: {}", .{err});
+        return -2;
+    };
     const do_ptr = global_allocator.create(Tensor) catch return -2;
     do_ptr.* = do_tensor;
-    defer { ctx.destroyTensor(do_ptr); global_allocator.destroy(do_ptr); }
+    defer {
+        ctx.destroyTensor(do_ptr);
+        global_allocator.destroy(do_ptr);
+    }
 
-    const lse_tensor = ctx.createTensor(lse_shape) catch |err| { setError("Create LSE failed: {}", .{err}); return -2; };
+    const lse_tensor = ctx.createTensor(lse_shape) catch |err| {
+        setError("Create LSE failed: {}", .{err});
+        return -2;
+    };
     const lse_ptr = global_allocator.create(Tensor) catch return -2;
     lse_ptr.* = lse_tensor;
-    defer { ctx.destroyTensor(lse_ptr); global_allocator.destroy(lse_ptr); }
+    defer {
+        ctx.destroyTensor(lse_ptr);
+        global_allocator.destroy(lse_ptr);
+    }
 
     // Create tensors for outputs (gradients)
-    const dq_tensor = ctx.createTensor(shape) catch |err| { setError("Create dQ failed: {}", .{err}); return -2; };
+    const dq_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create dQ failed: {}", .{err});
+        return -2;
+    };
     const dq_ptr = global_allocator.create(Tensor) catch return -2;
     dq_ptr.* = dq_tensor;
-    defer { ctx.destroyTensor(dq_ptr); global_allocator.destroy(dq_ptr); }
+    defer {
+        ctx.destroyTensor(dq_ptr);
+        global_allocator.destroy(dq_ptr);
+    }
 
-    const dk_tensor = ctx.createTensor(shape) catch |err| { setError("Create dK failed: {}", .{err}); return -2; };
+    const dk_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create dK failed: {}", .{err});
+        return -2;
+    };
     const dk_ptr = global_allocator.create(Tensor) catch return -2;
     dk_ptr.* = dk_tensor;
-    defer { ctx.destroyTensor(dk_ptr); global_allocator.destroy(dk_ptr); }
+    defer {
+        ctx.destroyTensor(dk_ptr);
+        global_allocator.destroy(dk_ptr);
+    }
 
-    const dv_tensor = ctx.createTensor(shape) catch |err| { setError("Create dV failed: {}", .{err}); return -2; };
+    const dv_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create dV failed: {}", .{err});
+        return -2;
+    };
     const dv_ptr = global_allocator.create(Tensor) catch return -2;
     dv_ptr.* = dv_tensor;
-    defer { ctx.destroyTensor(dv_ptr); global_allocator.destroy(dv_ptr); }
+    defer {
+        ctx.destroyTensor(dv_ptr);
+        global_allocator.destroy(dv_ptr);
+    }
 
     // Upload input data
-    ctx.upload(q_ptr, query[0..count]) catch |err| { setError("Upload Q failed: {}", .{err}); return -3; };
-    ctx.upload(k_ptr, key[0..count]) catch |err| { setError("Upload K failed: {}", .{err}); return -3; };
-    ctx.upload(v_ptr, value[0..count]) catch |err| { setError("Upload V failed: {}", .{err}); return -3; };
-    ctx.upload(o_ptr, output[0..count]) catch |err| { setError("Upload O failed: {}", .{err}); return -3; };
-    ctx.upload(do_ptr, grad_output[0..count]) catch |err| { setError("Upload dO failed: {}", .{err}); return -3; };
-    ctx.upload(lse_ptr, lse[0..lse_count]) catch |err| { setError("Upload LSE failed: {}", .{err}); return -3; };
+    ctx.upload(q_ptr, query[0..count]) catch |err| {
+        setError("Upload Q failed: {}", .{err});
+        return -3;
+    };
+    ctx.upload(k_ptr, key[0..count]) catch |err| {
+        setError("Upload K failed: {}", .{err});
+        return -3;
+    };
+    ctx.upload(v_ptr, value[0..count]) catch |err| {
+        setError("Upload V failed: {}", .{err});
+        return -3;
+    };
+    ctx.upload(o_ptr, output[0..count]) catch |err| {
+        setError("Upload O failed: {}", .{err});
+        return -3;
+    };
+    ctx.upload(do_ptr, grad_output[0..count]) catch |err| {
+        setError("Upload dO failed: {}", .{err});
+        return -3;
+    };
+    ctx.upload(lse_ptr, lse[0..lse_count]) catch |err| {
+        setError("Upload LSE failed: {}", .{err});
+        return -3;
+    };
 
     // Initialize output gradients to zero
     const zeros = global_allocator.alloc(f32, count) catch return -2;
     defer global_allocator.free(zeros);
     @memset(zeros, 0);
-    ctx.upload(dq_ptr, zeros) catch |err| { setError("Upload dQ zeros failed: {}", .{err}); return -3; };
-    ctx.upload(dk_ptr, zeros) catch |err| { setError("Upload dK zeros failed: {}", .{err}); return -3; };
-    ctx.upload(dv_ptr, zeros) catch |err| { setError("Upload dV zeros failed: {}", .{err}); return -3; };
+    ctx.upload(dq_ptr, zeros) catch |err| {
+        setError("Upload dQ zeros failed: {}", .{err});
+        return -3;
+    };
+    ctx.upload(dk_ptr, zeros) catch |err| {
+        setError("Upload dK zeros failed: {}", .{err});
+        return -3;
+    };
+    ctx.upload(dv_ptr, zeros) catch |err| {
+        setError("Upload dV zeros failed: {}", .{err});
+        return -3;
+    };
 
     // Compute backward pass
     engine.backwardSync(
@@ -754,9 +886,18 @@ export fn aule_attention_backward(
     };
 
     // Download gradients
-    ctx.download(dq_ptr, grad_query[0..count]) catch |err| { setError("Download dQ failed: {}", .{err}); return -5; };
-    ctx.download(dk_ptr, grad_key[0..count]) catch |err| { setError("Download dK failed: {}", .{err}); return -5; };
-    ctx.download(dv_ptr, grad_value[0..count]) catch |err| { setError("Download dV failed: {}", .{err}); return -5; };
+    ctx.download(dq_ptr, grad_query[0..count]) catch |err| {
+        setError("Download dQ failed: {}", .{err});
+        return -5;
+    };
+    ctx.download(dk_ptr, grad_key[0..count]) catch |err| {
+        setError("Download dK failed: {}", .{err});
+        return -5;
+    };
+    ctx.download(dv_ptr, grad_value[0..count]) catch |err| {
+        setError("Download dV failed: {}", .{err});
+        return -5;
+    };
 
     return 0;
 }
@@ -796,35 +937,74 @@ export fn aule_attention_forward_with_lse(
     const lse_count = batch_size * num_heads * seq_len;
 
     // Create tensors
-    const q_tensor = ctx.createTensor(shape) catch |err| { setError("Create Q failed: {}", .{err}); return -2; };
+    const q_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create Q failed: {}", .{err});
+        return -2;
+    };
     const q_ptr = global_allocator.create(Tensor) catch return -2;
     q_ptr.* = q_tensor;
-    defer { ctx.destroyTensor(q_ptr); global_allocator.destroy(q_ptr); }
+    defer {
+        ctx.destroyTensor(q_ptr);
+        global_allocator.destroy(q_ptr);
+    }
 
-    const k_tensor = ctx.createTensor(shape) catch |err| { setError("Create K failed: {}", .{err}); return -2; };
+    const k_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create K failed: {}", .{err});
+        return -2;
+    };
     const k_ptr = global_allocator.create(Tensor) catch return -2;
     k_ptr.* = k_tensor;
-    defer { ctx.destroyTensor(k_ptr); global_allocator.destroy(k_ptr); }
+    defer {
+        ctx.destroyTensor(k_ptr);
+        global_allocator.destroy(k_ptr);
+    }
 
-    const v_tensor = ctx.createTensor(shape) catch |err| { setError("Create V failed: {}", .{err}); return -2; };
+    const v_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create V failed: {}", .{err});
+        return -2;
+    };
     const v_ptr = global_allocator.create(Tensor) catch return -2;
     v_ptr.* = v_tensor;
-    defer { ctx.destroyTensor(v_ptr); global_allocator.destroy(v_ptr); }
+    defer {
+        ctx.destroyTensor(v_ptr);
+        global_allocator.destroy(v_ptr);
+    }
 
-    const o_tensor = ctx.createTensor(shape) catch |err| { setError("Create Output failed: {}", .{err}); return -2; };
+    const o_tensor = ctx.createTensor(shape) catch |err| {
+        setError("Create Output failed: {}", .{err});
+        return -2;
+    };
     const o_ptr = global_allocator.create(Tensor) catch return -2;
     o_ptr.* = o_tensor;
-    defer { ctx.destroyTensor(o_ptr); global_allocator.destroy(o_ptr); }
+    defer {
+        ctx.destroyTensor(o_ptr);
+        global_allocator.destroy(o_ptr);
+    }
 
-    const lse_tensor = ctx.createTensor(lse_shape) catch |err| { setError("Create LSE failed: {}", .{err}); return -2; };
+    const lse_tensor = ctx.createTensor(lse_shape) catch |err| {
+        setError("Create LSE failed: {}", .{err});
+        return -2;
+    };
     const lse_ptr = global_allocator.create(Tensor) catch return -2;
     lse_ptr.* = lse_tensor;
-    defer { ctx.destroyTensor(lse_ptr); global_allocator.destroy(lse_ptr); }
+    defer {
+        ctx.destroyTensor(lse_ptr);
+        global_allocator.destroy(lse_ptr);
+    }
 
     // Upload data
-    ctx.upload(q_ptr, query[0..count]) catch |err| { setError("Upload Q failed: {}", .{err}); return -3; };
-    ctx.upload(k_ptr, key[0..count]) catch |err| { setError("Upload K failed: {}", .{err}); return -3; };
-    ctx.upload(v_ptr, value[0..count]) catch |err| { setError("Upload V failed: {}", .{err}); return -3; };
+    ctx.upload(q_ptr, query[0..count]) catch |err| {
+        setError("Upload Q failed: {}", .{err});
+        return -3;
+    };
+    ctx.upload(k_ptr, key[0..count]) catch |err| {
+        setError("Upload K failed: {}", .{err});
+        return -3;
+    };
+    ctx.upload(v_ptr, value[0..count]) catch |err| {
+        setError("Upload V failed: {}", .{err});
+        return -3;
+    };
 
     // Compute forward with LSE
     engine.forwardWithLse(
@@ -845,8 +1025,14 @@ export fn aule_attention_forward_with_lse(
     };
 
     // Download output and LSE
-    ctx.download(o_ptr, output[0..count]) catch |err| { setError("Download output failed: {}", .{err}); return -5; };
-    ctx.download(lse_ptr, lse_out[0..lse_count]) catch |err| { setError("Download LSE failed: {}", .{err}); return -5; };
+    ctx.download(o_ptr, output[0..count]) catch |err| {
+        setError("Download output failed: {}", .{err});
+        return -5;
+    };
+    ctx.download(lse_ptr, lse_out[0..lse_count]) catch |err| {
+        setError("Download LSE failed: {}", .{err});
+        return -5;
+    };
 
     return 0;
 }
@@ -910,30 +1096,42 @@ pub const Attention = struct {
 
         // 1. Create tensors
         // Create actual Tensor structs on heap as expected by destroyTensor
-        
+
         var q_t = try self.context.createTensor(shape);
         errdefer self.context.destroyTensor(&q_t);
         const q_ptr = try self.allocator.create(Tensor);
         q_ptr.* = q_t;
-        defer { self.context.destroyTensor(q_ptr); self.allocator.destroy(q_ptr); }
+        defer {
+            self.context.destroyTensor(q_ptr);
+            self.allocator.destroy(q_ptr);
+        }
 
         var k_t = try self.context.createTensor(shape);
         errdefer self.context.destroyTensor(&k_t);
         const k_ptr = try self.allocator.create(Tensor);
         k_ptr.* = k_t;
-        defer { self.context.destroyTensor(k_ptr); self.allocator.destroy(k_ptr); }
+        defer {
+            self.context.destroyTensor(k_ptr);
+            self.allocator.destroy(k_ptr);
+        }
 
         var v_t = try self.context.createTensor(shape);
         errdefer self.context.destroyTensor(&v_t);
         const v_ptr = try self.allocator.create(Tensor);
         v_ptr.* = v_t;
-        defer { self.context.destroyTensor(v_ptr); self.allocator.destroy(v_ptr); }
+        defer {
+            self.context.destroyTensor(v_ptr);
+            self.allocator.destroy(v_ptr);
+        }
 
         var o_t = try self.context.createTensor(shape);
         errdefer self.context.destroyTensor(&o_t);
         const o_ptr = try self.allocator.create(Tensor);
         o_ptr.* = o_t;
-        defer { self.context.destroyTensor(o_ptr); self.allocator.destroy(o_ptr); }
+        defer {
+            self.context.destroyTensor(o_ptr);
+            self.allocator.destroy(o_ptr);
+        }
 
         // 2. Upload
         try self.context.upload(q_ptr, Q[0..count]);
