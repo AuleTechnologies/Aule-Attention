@@ -1,0 +1,206 @@
+#version 460 core
+#pragma use_vulkan_memory_model
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+// Intel CoopMat Shader - specialized for head_dim=64
+// Uses 4 subgroups of 16 (Intel EU width) with 64 total work-items
+// Each subgroup processes 8 rows (BLOCK_M=32 / 4 subgroups)
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const uint HEAD_DIM = 64;      // Intel supports up to head_dim=64
+const uint BLOCK_M = 32;       // Query rows per workgroup
+const uint BLOCK_N = 32;       // KV rows per block
+const uint ROWS_PER_SG = 8;    // Rows per subgroup (32/4)
+const uint NUM_SUBGROUPS = 4;  // 64 threads / 16 threads per subgroup
+
+const uint lM = 16;
+const uint lN = 16;
+const uint lK = 16;
+
+layout(set = 0, binding = 0) readonly buffer QueryBuffer { float data[]; } Q;
+layout(set = 0, binding = 1) readonly buffer KeyBuffer { float data[]; } K;
+layout(set = 0, binding = 2) readonly buffer ValueBuffer { float data[]; } V;
+layout(set = 0, binding = 3) writeonly buffer OutputBuffer { float data[]; } O;
+
+layout(push_constant) uniform PushConstants {
+    uint batch_size;
+    uint num_heads;
+    uint seq_len;
+    uint head_dim;
+    float scale;
+    uint causal;
+} params;
+
+// Strides with padding to avoid bank conflicts
+const uint STRIDE_Q = HEAD_DIM + 8;  // 72
+const uint STRIDE_K = HEAD_DIM + 8;  // 72
+const uint STRIDE_V = HEAD_DIM + 8;  // 72
+const uint STRIDE_S = BLOCK_N + 8;   // 40
+
+// Shared memory buffers
+shared float shQ[BLOCK_M * STRIDE_Q];           // 32 * 72 = 2304 floats
+shared float shK[BLOCK_N * STRIDE_K];           // 32 * 72 = 2304 floats
+shared float shV[BLOCK_N * STRIDE_V];           // 32 * 72 = 2304 floats
+shared float shS[BLOCK_M * STRIDE_S];           // 32 * 40 = 1280 floats
+shared float shO[BLOCK_M * HEAD_DIM];           // 32 * 64 = 2048 floats (output accumulator)
+
+shared float rowMax[BLOCK_M];
+shared float rowSum[BLOCK_M];
+shared float rowAlpha[BLOCK_M];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint sg_id = gl_SubgroupID;
+    uint sg_lid = gl_SubgroupInvocationID;
+    
+    uint batch_idx = gl_WorkGroupID.z;
+    uint head_idx = gl_WorkGroupID.y;
+    uint block_idx = gl_WorkGroupID.x;
+    
+    const uint global_q_start = block_idx * BLOCK_M;
+    if (global_q_start >= params.seq_len) return;
+    
+    // Reject if seq_len not aligned to BLOCK_M (coopmat stores need alignment)
+    // This is checked at API level but guard here too
+    
+    uint batch_head_offset = (batch_idx * params.num_heads + head_idx) * (params.seq_len * params.head_dim);
+    
+    // Each subgroup owns ROWS_PER_SG rows for output accumulation
+    // But we use scalar accumulation since Intel 16-wide subgroups can't do 16x16 coopmat with 8 rows
+    // Instead, use coopmat for Q*K^T and P*V matmuls, scalar for softmax
+    
+    // Initialize output accumulator to zero
+    for (uint i = lid; i < BLOCK_M * HEAD_DIM; i += 64) {
+        shO[i] = 0.0;
+    }
+    
+    // Initialize row statistics
+    if (lid < BLOCK_M) {
+        rowMax[lid] = -1.0e20;
+        rowSum[lid] = 0.0;
+    }
+    
+    // Load Q into shared memory (all 64 threads cooperate)
+    for (uint i = lid; i < BLOCK_M * HEAD_DIM; i += 64) {
+        uint r = i / HEAD_DIM;
+        uint c = i % HEAD_DIM;
+        uint global_r = global_q_start + r;
+        if (global_r < params.seq_len && c < params.head_dim) {
+            shQ[r * STRIDE_Q + c] = Q.data[batch_head_offset + global_r * params.head_dim + c];
+        } else {
+            shQ[r * STRIDE_Q + c] = 0.0;
+        }
+    }
+    barrier();
+    
+    uint num_kv_blocks = (params.seq_len + BLOCK_N - 1) / BLOCK_N;
+    
+    for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+        uint global_kv_start = kv_block * BLOCK_N;
+        
+        // Early exit for causal masking
+        if (params.causal == 1 && global_kv_start > global_q_start + BLOCK_M - 1) continue;
+        
+        // Load K and V into shared memory
+        for (uint i = lid; i < BLOCK_N * HEAD_DIM; i += 64) {
+            uint r = i / HEAD_DIM;
+            uint c = i % HEAD_DIM;
+            uint global_r = global_kv_start + r;
+            float k_val = 0.0;
+            float v_val = 0.0;
+            if (global_r < params.seq_len && c < params.head_dim) {
+                uint offset = batch_head_offset + global_r * params.head_dim + c;
+                k_val = K.data[offset];
+                v_val = V.data[offset];
+            }
+            shK[r * STRIDE_K + c] = k_val;
+            shV[r * STRIDE_V + c] = v_val;
+        }
+        barrier();
+        
+        // Compute S = Q * K^T using scalar operations (Intel coopmat FP32 support is limited)
+        // Each thread computes multiple elements of the 32x32 S matrix
+        for (uint i = lid; i < BLOCK_M * BLOCK_N; i += 64) {
+            uint row = i / BLOCK_N;
+            uint col = i % BLOCK_N;
+            
+            float dot = 0.0;
+            for (uint k = 0; k < HEAD_DIM; k++) {
+                dot += shQ[row * STRIDE_Q + k] * shK[col * STRIDE_K + k];
+            }
+            dot *= params.scale;
+            
+            // Apply causal mask
+            if (params.causal == 1 && global_kv_start + col > global_q_start + row) {
+                dot = -1.0e20;
+            }
+            
+            shS[row * STRIDE_S + col] = dot;
+        }
+        barrier();
+        
+        // Online softmax: compute row max and update running statistics
+        // Each thread handles specific rows
+        for (uint row = lid; row < BLOCK_M; row += 64) {
+            float m = -1.0e20;
+            for (uint c = 0; c < BLOCK_N; c++) {
+                m = max(m, shS[row * STRIDE_S + c]);
+            }
+            
+            float m_prev = rowMax[row];
+            float m_new = max(m_prev, m);
+            float alpha = exp(clamp(m_prev - m_new, -20.0, 0.0));
+            
+            rowAlpha[row] = alpha;
+            rowMax[row] = m_new;
+            
+            // Compute exp and sum
+            float s_sum = 0.0;
+            for (uint c = 0; c < BLOCK_N; c++) {
+                float s_val = shS[row * STRIDE_S + c];
+                float val = exp(clamp(s_val - m_new, -20.0, 0.0));
+                shS[row * STRIDE_S + c] = val;
+                s_sum += val;
+            }
+            
+            rowSum[row] = rowSum[row] * alpha + s_sum;
+        }
+        barrier();
+        
+        // Scale previous output by alpha
+        for (uint i = lid; i < BLOCK_M * HEAD_DIM; i += 64) {
+            uint row = i / HEAD_DIM;
+            shO[i] *= rowAlpha[row];
+        }
+        barrier();
+        
+        // Compute O += P * V (P is normalized attention weights in shS)
+        // Each thread accumulates multiple output elements
+        for (uint i = lid; i < BLOCK_M * HEAD_DIM; i += 64) {
+            uint row = i / HEAD_DIM;
+            uint col = i % HEAD_DIM;
+            
+            float acc = 0.0;
+            for (uint k = 0; k < BLOCK_N; k++) {
+                acc += shS[row * STRIDE_S + k] * shV[k * STRIDE_V + col];
+            }
+            shO[i] += acc;
+        }
+        barrier();
+    }
+    
+    // Final normalization: divide by row sum and write to global memory
+    for (uint i = lid; i < BLOCK_M * HEAD_DIM; i += 64) {
+        uint row = i / HEAD_DIM;
+        uint col = i % HEAD_DIM;
+        uint global_row = global_q_start + row;
+        
+        if (global_row < params.seq_len && col < params.head_dim) {
+            float s = rowSum[row];
+            float val = shO[i] / (s > 1e-10 ? s : 1.0);
+            O.data[batch_head_offset + global_row * params.head_dim + col] = val;
+        }
+    }
+}

@@ -1,0 +1,34 @@
+#version 460 core
+#pragma use_vulkan_memory_model
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+// NVIDIA Backward Placeholder - Compiles but does nothing yet
+// This allows the build system to proceed while we focus on Forward performance
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QueryBuffer { float data[]; } Q;
+layout(set = 0, binding = 1) readonly buffer KeyBuffer { float data[]; } K;
+layout(set = 0, binding = 2) readonly buffer ValueBuffer { float data[]; } V;
+layout(set = 0, binding = 3) readonly buffer GradOutputBuffer { float data[]; } dO;
+layout(set = 0, binding = 4) readonly buffer LogSumExpBuffer { float data[]; } LSE;
+layout(set = 0, binding = 5) writeonly buffer GradKeyBuffer { float data[]; } dQ;
+layout(set = 0, binding = 6) writeonly buffer GradValueBuffer { float data[]; } dK;
+layout(set = 0, binding = 7) writeonly buffer GradValueBuffer_V { float data[]; } dV;
+
+layout(push_constant) uniform PushConstants {
+    uint batch_size;
+    uint num_heads;
+    uint seq_len;
+    uint head_dim;
+    float scale;
+    uint causal;
+} params;
+
+void main() {
+    // No-op for now to satisfy build system
+}

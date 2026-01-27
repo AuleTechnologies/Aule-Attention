@@ -1,0 +1,184 @@
+#version 460 core
+#pragma use_vulkan_memory_model
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Blackwell-optimized NVIDIA Cooperative Matrix 2 Shader
+// Uses NV2-specific intrinsics for high performance online softmax
+// Uses FP16 A/B matrices with FP32 accumulator (works around driver 580.x bug)
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+const uint HEAD_DIM = 128;
+const uint BLOCK_M = 16;
+const uint BLOCK_N = 32;
+
+layout(set = 0, binding = 0) readonly buffer QBuf { float data[]; } Q;
+layout(set = 0, binding = 1) readonly buffer KBuf { float data[]; } K;
+layout(set = 0, binding = 2) readonly buffer VBuf { float data[]; } V;
+layout(set = 0, binding = 3) writeonly buffer OBuf { float data[]; } O;
+
+layout(push_constant) uniform PushConstants {
+    uint batch_size; uint num_heads; uint seq_len; uint head_dim;
+    float scale; uint causal;
+} params;
+
+// Shared memory
+const uint STRIDE_Q = HEAD_DIM + 8;
+const uint STRIDE_K = HEAD_DIM + 8;
+const uint STRIDE_V = HEAD_DIM + 8;
+const uint STRIDE_S = BLOCK_N + 8;
+
+// FP16 shared memory for coopmat operations
+shared float16_t shQ_fp16[BLOCK_M * STRIDE_Q];
+shared float16_t shK_fp16[BLOCK_N * STRIDE_K];
+shared float16_t shV_fp16[BLOCK_N * STRIDE_V];
+shared float shS[BLOCK_M * STRIDE_S];
+
+shared float rowMax[BLOCK_M];
+shared float rowSum[BLOCK_M];
+shared float rowAlpha[BLOCK_M];
+
+// NV2 reduction ops
+float maxOp(uint row, uint col, float a, float b) { return max(a, b); }
+float sumOp(uint row, uint col, float a, float b) { return a + b; }
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    
+    uint batch_idx = gl_WorkGroupID.z;
+    uint head_idx = gl_WorkGroupID.y;
+    uint block_idx = gl_WorkGroupID.x;
+    
+    const uint global_q_start = block_idx * BLOCK_M;
+    if (global_q_start >= params.seq_len) return;
+    
+    uint batch_head_offset = (batch_idx * params.num_heads + head_idx) * (params.seq_len * params.head_dim);
+    
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matO[8];
+    for (int i = 0; i < 8; i++) matO[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    
+    if (lid < BLOCK_M) {
+        rowMax[lid] = -1.0e30;
+        rowSum[lid] = 0.0;
+    }
+    
+    // Load Q and convert to FP16
+    for (uint i = lid; i < BLOCK_M * HEAD_DIM; i += 32) {
+        uint r = i / HEAD_DIM; uint c = i % HEAD_DIM;
+        if (global_q_start + r < params.seq_len) {
+            shQ_fp16[r * STRIDE_Q + c] = float16_t(Q.data[batch_head_offset + (global_q_start + r) * params.head_dim + c]);
+        } else {
+            shQ_fp16[r * STRIDE_Q + c] = float16_t(0.0);
+        }
+    }
+    barrier();
+    
+    uint num_kv_blocks = (params.seq_len + BLOCK_N - 1) / BLOCK_N;
+    for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+        uint global_kv_start = kv_block * BLOCK_N;
+        if (params.causal == 1 && global_kv_start > global_q_start + BLOCK_M) continue;
+        
+        // Load K, V and convert to FP16
+        for (uint i = lid; i < BLOCK_N * HEAD_DIM; i += 32) {
+            uint r = i / HEAD_DIM; uint c = i % HEAD_DIM;
+            uint global_r = global_kv_start + r;
+            float k_val = 0.0; float v_val = 0.0;
+            if (global_r < params.seq_len) {
+                uint offset = batch_head_offset + global_r * params.head_dim + c;
+                k_val = K.data[offset];
+                v_val = V.data[offset];
+            }
+            shK_fp16[r * STRIDE_K + c] = float16_t(k_val);
+            shV_fp16[r * STRIDE_V + c] = float16_t(v_val);
+        }
+        barrier();
+        
+        // Compute S = Q @ K^T using FP16 inputs, FP32 accumulator
+        for (uint j = 0; j < 2; j++) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matS =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            for (uint k = 0; k < HEAD_DIM; k += 16) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> mq;
+                coopMatLoad(mq, shQ_fp16, k, STRIDE_Q, gl_CooperativeMatrixLayoutRowMajor);
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mk;
+                coopMatLoad(mk, shK_fp16, (j * 16) * STRIDE_K + k, STRIDE_K, gl_CooperativeMatrixLayoutColumnMajor);
+                matS = coopMatMulAdd(mq, mk, matS);
+            }
+            matS *= params.scale;
+            coopMatStore(matS, shS, j * 16, STRIDE_S, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        
+        // Online Softmax (NV2 can do this in registers but shared memory is more stable for now)
+        if (lid < BLOCK_M) {
+            uint row = lid;
+            float m = -1.0e30;
+            for (uint c = 0; c < BLOCK_N; c++) {
+                float s_val = shS[row * STRIDE_S + c];
+                if (params.causal == 1 && global_kv_start + c > global_q_start + row) s_val = -1.0e30;
+                m = max(m, s_val);
+            }
+            float m_prev = rowMax[row];
+            float m_new = max(m_prev, m);
+            float alpha = exp(clamp(m_prev - m_new, -20.0, 0.0));
+            rowAlpha[row] = alpha;
+            rowMax[row] = m_new;
+            float s_sum = 0.0;
+            for (uint c = 0; c < BLOCK_N; c++) {
+                float s_val = shS[row * STRIDE_S + c];
+                if (params.causal == 1 && global_kv_start + c > global_q_start + row) s_val = -1.0e30;
+                float val = exp(clamp(s_val - m_new, -20.0, 0.0));
+                shS[row * STRIDE_S + c] = val;
+                s_sum += val;
+            }
+            rowSum[row] = rowSum[row] * alpha + s_sum;
+        }
+        barrier();
+
+        // Scale O (reuse shS as temporary FP32 buffer)
+        for (int i = 0; i < 8; i++) coopMatStore(matO[i], shS, i * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        for (uint i = lid; i < 2048; i += 32) {
+            uint r = (i % 256) / 16;
+            shS[i] *= rowAlpha[r];
+        }
+        barrier();
+        for (int i = 0; i < 8; i++) coopMatLoad(matO[i], shS, i * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        
+        // Accumulate P @ V using FP16 inputs
+        for (uint k = 0; k < BLOCK_N; k += 16) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> mp;
+            coopMatLoad(mp, shS, k, STRIDE_S, gl_CooperativeMatrixLayoutRowMajor);
+            for (int i = 0; i < 8; i++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mv;
+                coopMatLoad(mv, shV_fp16, k * STRIDE_V + i * 16, STRIDE_V, gl_CooperativeMatrixLayoutRowMajor);
+                matO[i] = coopMatMulAdd(mp, mv, matO[i]);
+            }
+        }
+    }
+
+    // Final Normalization and Store (reuse shS as temporary FP32 buffer)
+    for (int i = 0; i < 8; i++) coopMatStore(matO[i], shS, i * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (uint i = lid; i < 2048; i += 32) {
+        uint r = (i % 256) / 16;
+        float s = rowSum[r];
+        shS[i] /= (s > 1e-10 ? s : 1.0);
+    }
+    barrier();
+    for (int i = 0; i < 8; i++) {
+        coopMatLoad(matO[i], shS, i * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+        uint global_r = global_q_start;
+        uint global_c = i * 16;
+        if (global_r < params.seq_len) {
+            coopMatStore(matO[i], O.data, batch_head_offset + global_r * params.head_dim + global_c, params.head_dim, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

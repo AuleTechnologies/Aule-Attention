@@ -121,6 +121,19 @@ pub fn build(b: *std.Build) void {
     const attention_f16_amd_spv = attention_f16_amd_compile.addOutputFileArg("attention_f16_amd.spv");
     attention_f16_amd_compile.addFileArg(b.path("shaders/attention_f16_amd.comp"));
 
+    // --- Cooperative Matrix & Tiled Shaders ---
+    const attention_coopmat_khr_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.3", "-o" });
+    const attention_coopmat_khr_spv = attention_coopmat_khr_compile.addOutputFileArg("attention_coopmat_khr.spv");
+    attention_coopmat_khr_compile.addFileArg(b.path("shaders/attention_coopmat_khr.comp"));
+
+    const attention_tiled_fp32_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.3", "-o" });
+    const attention_tiled_fp32_spv = attention_tiled_fp32_compile.addOutputFileArg("attention_tiled_fp32.spv");
+    attention_tiled_fp32_compile.addFileArg(b.path("shaders/attention_tiled_fp32.comp"));
+
+    const attention_coopmat_backward_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.3", "-o" });
+    const attention_coopmat_backward_spv = attention_coopmat_backward_compile.addOutputFileArg("attention_coopmat_backward.spv");
+    attention_coopmat_backward_compile.addFileArg(b.path("shaders/attention_coopmat_backward.comp"));
+
     // --- Paged Attention Shader (for PagedAttention feature) ---
     const attention_paged_compile = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
     const attention_paged_spv = attention_paged_compile.addOutputFileArg("attention_paged.spv");
@@ -147,7 +160,7 @@ pub fn build(b: *std.Build) void {
     lib.root_module.addAnonymousImport("attention_fwd_lse_spv", .{ .root_source_file = attention_fwd_lse_spv });
     lib.root_module.addAnonymousImport("spatial_sort_spv", .{ .root_source_file = spatial_sort_spv });
     lib.root_module.addAnonymousImport("attention_gravity_spv", .{ .root_source_file = attention_gravity_spv });
-    
+
     // Radix Imports
     lib.root_module.addAnonymousImport("radix_count_spv", .{ .root_source_file = radix_count_spv });
     lib.root_module.addAnonymousImport("radix_scan_spv", .{ .root_source_file = radix_scan_spv });
@@ -161,6 +174,9 @@ pub fn build(b: *std.Build) void {
     // FP16 shader imports
     lib.root_module.addAnonymousImport("attention_f16_spv", .{ .root_source_file = attention_f16_spv });
     lib.root_module.addAnonymousImport("attention_f16_amd_spv", .{ .root_source_file = attention_f16_amd_spv });
+    lib.root_module.addAnonymousImport("attention_coopmat_khr_spv", .{ .root_source_file = attention_coopmat_khr_spv });
+    lib.root_module.addAnonymousImport("attention_tiled_fp32_spv", .{ .root_source_file = attention_tiled_fp32_spv });
+    lib.root_module.addAnonymousImport("attention_coopmat_backward_spv", .{ .root_source_file = attention_coopmat_backward_spv });
 
     // Paged attention shaders
     lib.root_module.addAnonymousImport("attention_paged_spv", .{ .root_source_file = attention_paged_spv });
@@ -190,7 +206,7 @@ pub fn build(b: *std.Build) void {
     static_lib.root_module.addAnonymousImport("attention_fwd_lse_spv", .{ .root_source_file = attention_fwd_lse_spv });
     static_lib.root_module.addAnonymousImport("spatial_sort_spv", .{ .root_source_file = spatial_sort_spv });
     static_lib.root_module.addAnonymousImport("attention_gravity_spv", .{ .root_source_file = attention_gravity_spv });
-    
+
     // Radix Imports
     static_lib.root_module.addAnonymousImport("radix_count_spv", .{ .root_source_file = radix_count_spv });
     static_lib.root_module.addAnonymousImport("radix_scan_spv", .{ .root_source_file = radix_scan_spv });
@@ -204,6 +220,9 @@ pub fn build(b: *std.Build) void {
     // FP16 shader imports (static)
     static_lib.root_module.addAnonymousImport("attention_f16_spv", .{ .root_source_file = attention_f16_spv });
     static_lib.root_module.addAnonymousImport("attention_f16_amd_spv", .{ .root_source_file = attention_f16_amd_spv });
+    static_lib.root_module.addAnonymousImport("attention_coopmat_khr_spv", .{ .root_source_file = attention_coopmat_khr_spv });
+    static_lib.root_module.addAnonymousImport("attention_tiled_fp32_spv", .{ .root_source_file = attention_tiled_fp32_spv });
+    static_lib.root_module.addAnonymousImport("attention_coopmat_backward_spv", .{ .root_source_file = attention_coopmat_backward_spv });
 
     // Paged attention shaders (static)
     static_lib.root_module.addAnonymousImport("attention_paged_spv", .{ .root_source_file = attention_paged_spv });
@@ -303,7 +322,7 @@ pub fn build(b: *std.Build) void {
     benchmark.root_module.addImport("aule", static_lib.root_module);
     // Note: static_lib already has vulkan/libc linked, but we might need to ensure transient deps work
     // Ideally we link shared 'lib' or static 'static_lib' module.
-    
+
     const run_benchmark = b.addRunArtifact(benchmark);
     const benchmark_step = b.step("benchmark", "Run attention benchmark");
     benchmark_step.dependOn(&run_benchmark.step);

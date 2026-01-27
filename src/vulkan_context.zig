@@ -30,6 +30,7 @@ pub const GpuCapabilities = struct {
     fp16_supported: bool,
     subgroup_size: u32, // Wavefront/warp size
     device_name: [256]u8,
+    has_coopmat: bool = false, // VK_KHR_cooperative_matrix
 
     pub fn isAmd(self: GpuCapabilities) bool {
         return self.vendor == .amd;
@@ -98,10 +99,11 @@ pub const VulkanContext = struct {
         const device_properties = vki.getPhysicalDeviceProperties(physical_device);
 
         // Detect GPU capabilities
-        const gpu_caps = detectGpuCapabilities(device_properties);
+        const gpu_caps = detectGpuCapabilities(allocator, vki, physical_device, device_properties);
         log.info("Selected GPU: {s}", .{gpu_caps.getDeviceName()});
         log.info("  Vendor: {s}, AMD Arch: {s}", .{ @tagName(gpu_caps.vendor), @tagName(gpu_caps.amd_arch) });
         log.info("  FP16: {}, Subgroup size: {}", .{ gpu_caps.fp16_supported, gpu_caps.subgroup_size });
+        log.info("  CoopMat: {}", .{gpu_caps.has_coopmat});
 
         // Create logical device with compute queue
         const queue_priority: f32 = 1.0;
@@ -207,17 +209,40 @@ pub const VulkanContext = struct {
 };
 
 /// Detect GPU vendor and architecture from device properties
-fn detectGpuCapabilities(props: vk.PhysicalDeviceProperties) GpuCapabilities {
+fn detectGpuCapabilities(
+    allocator: std.mem.Allocator,
+    vki: InstanceDispatch,
+    pdev: vk.PhysicalDevice,
+    props: vk.PhysicalDeviceProperties,
+) !GpuCapabilities {
     var caps = GpuCapabilities{
         .vendor = .other,
         .amd_arch = .unknown,
         .fp16_supported = false,
         .subgroup_size = 32, // Default
         .device_name = undefined,
+        .has_coopmat = false,
     };
 
     // Copy device name
     @memcpy(&caps.device_name, &props.device_name);
+
+    // Check extensions
+    var ext_count: u32 = 0;
+    _ = try vki.enumerateDeviceExtensionProperties(pdev, null, &ext_count, null);
+
+    if (ext_count > 0) {
+        const extensions = try allocator.alloc(vk.ExtensionProperties, ext_count);
+        defer allocator.free(extensions);
+        _ = try vki.enumerateDeviceExtensionProperties(pdev, null, &ext_count, extensions.ptr);
+
+        for (extensions) |ext| {
+            const name = std.mem.sliceTo(&ext.extension_name, 0);
+            if (std.mem.eql(u8, name, "VK_KHR_cooperative_matrix")) {
+                caps.has_coopmat = true;
+            }
+        }
+    }
 
     // Detect vendor from vendor ID
     // AMD: 0x1002, NVIDIA: 0x10DE, Intel: 0x8086, Apple: 0x106B
@@ -353,6 +378,7 @@ const apis: []const vk.ApiInfo = &.{
             .getPhysicalDeviceMemoryProperties = true,
             .createDevice = true,
             .getDeviceProcAddr = true,
+            .enumerateDeviceExtensionProperties = true,
         },
         .device_commands = .{
             .destroyDevice = true,
